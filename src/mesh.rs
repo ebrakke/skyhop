@@ -429,6 +429,81 @@ pub fn torus(minor: f32) -> MeshData {
     m
 }
 
+/// A party balloon, radius 1 and a little taller than wide, pinched toward the knot, on a
+/// ribbon. White, so it takes the tint's colour.
+pub fn balloon() -> MeshData {
+    let mut m = MeshData::default();
+    let (nu, nv) = (20, 14);
+    let white = rgb(1.0, 1.0, 1.0);
+    for v in 0..=nv {
+        let th = v as f32 / nv as f32 * std::f32::consts::PI;
+        let pinch = 1.0 - 0.45 * crate::world::smoothstep(0.55, 1.0, th / std::f32::consts::PI);
+        for u in 0..=nu {
+            let ph = u as f32 / nu as f32 * std::f32::consts::TAU;
+            let n = vec3(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin());
+            m.vert(vec3(n.x * pinch, n.y * 1.18, n.z * pinch), n, white);
+        }
+    }
+    for v in 0..nv {
+        for u in 0..nu {
+            let a = (v * (nu + 1) + u) as u32;
+            let b = a + (nu + 1) as u32;
+            m.i.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    m.cone(vec3(0.0, -1.32, 0.0), Vec3::Y, 0.14, 0.2, 8, white);
+    m.beam(vec3(0.0, -1.3, 0.0), vec3(0.08, -3.6, 0.05), 0.035, white);
+    m
+}
+
+/// A rainbow road along `path`: six coloured lanes between white edges, banked into the
+/// turns. Drawn see-through and glowing.
+pub fn rainbow_road(path: &[Vec3]) -> MeshData {
+    let mut m = MeshData::default();
+    let bands: [(f32, Col); 8] = [
+        (1.2, rgb(1.0, 1.0, 1.0)),
+        (5.5, rgb(1.0, 0.2, 0.25)),
+        (5.5, rgb(1.0, 0.6, 0.1)),
+        (5.5, rgb(1.0, 0.92, 0.2)),
+        (5.5, rgb(0.25, 0.85, 0.35)),
+        (5.5, rgb(0.25, 0.55, 1.0)),
+        (5.5, rgb(0.7, 0.35, 1.0)),
+        (1.2, rgb(1.0, 1.0, 1.0)),
+    ];
+    let width: f32 = bands.iter().map(|b| b.0).sum();
+    let n = path.len();
+    if n < 3 {
+        return m;
+    }
+    let mut prev: Option<u32> = None;
+    for i in 0..n {
+        let (a, b) = (path[i.saturating_sub(1)], path[(i + 1).min(n - 1)]);
+        let t = (b - a).normalize_or_zero();
+        // bank into the turn: how fast the heading is changing here
+        let (a2, b2) = (path[i.saturating_sub(8)], path[(i + 8).min(n - 1)]);
+        let turn = (a - a2).normalize_or_zero().cross((b2 - b).normalize_or_zero()).y;
+        let bank = (turn * 2.5).clamp(-0.45, 0.45);
+        let flat = t.cross(Vec3::Y).normalize_or_zero();
+        let side = Quat::from_axis_angle(t, -bank) * flat;
+        let up = side.cross(t).normalize_or_zero();
+        let base = m.v.len() as u32;
+        let mut x = -width / 2.0;
+        for (w, c) in bands {
+            m.vert(path[i] + side * x, up, c);
+            m.vert(path[i] + side * (x + w), up, c);
+            x += w;
+        }
+        if let Some(p) = prev {
+            for k in 0..bands.len() as u32 {
+                let (a0, a1, b0, b1) = (p + k * 2, p + k * 2 + 1, base + k * 2, base + k * 2 + 1);
+                m.i.extend_from_slice(&[a0, a1, b1, a0, b1, b0]);
+            }
+        }
+        prev = Some(base);
+    }
+    m
+}
+
 /// Unit sprite for smoke and dust: opaque in the middle, fading to nothing at the rim.
 pub fn puff() -> MeshData {
     let mut m = MeshData::default();

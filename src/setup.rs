@@ -91,10 +91,18 @@ impl FreeSetup {
         AIRCRAFT[self.craft].0
     }
 
-    /// Label and value of each row.
-    pub fn rows(&self) -> Vec<(&'static str, String)> {
+    /// Label and value of each row; `locked` is how many more stars the aircraft needs.
+    pub fn rows(&self, locked: Option<u32>) -> Vec<(&'static str, String)> {
+        let aircraft = match locked {
+            Some(_) => format!("{} (locked)", AIRCRAFT[self.craft].1),
+            None => AIRCRAFT[self.craft].1.to_string(),
+        };
+        let fly = match locked {
+            Some(n) => format!("Earn {n} more star{} to fly this one", if n == 1 { "" } else { "s" }),
+            None => "Fly!".to_string(),
+        };
         vec![
-            ("Aircraft", AIRCRAFT[self.craft].1.to_string()),
+            ("Aircraft", aircraft),
             ("Start", PLACES[self.place].1.to_string()),
             ("Time", clock(self.hour)),
             ("Wind", if WINDS[self.wind] == 0.0 { "calm".into() } else { format!("{:.0} kt", WINDS[self.wind]) }),
@@ -105,7 +113,7 @@ impl FreeSetup {
             ("Cloud base", format!("{:.0} ft", BASES[self.base])),
             ("Visibility", format!("{:.0} km", VIS[self.vis])),
             ("Thermals", THERMALS[self.thermals].1.to_string()),
-            ("", "Fly!".to_string()),
+            ("", fly),
         ]
     }
 
@@ -218,29 +226,39 @@ pub struct Profile {
     values: BTreeMap<String, String>,
 }
 
-fn profile_path() -> Option<std::path::PathBuf> {
+/// The folder Skyhop saves into (the profile, ghosts); SKYHOP_DATA overrides it.
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("SKYHOP_DATA") {
+        return Some(d.into());
+    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let dir = if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         home?.join("Library/Application Support/Skyhop")
     } else if cfg!(windows) {
         std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("Skyhop")
     } else {
         std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".config")))?.join("skyhop")
-    };
-    Some(dir.join("profile.txt"))
+    })
+}
+
+fn profile_path() -> Option<std::path::PathBuf> {
+    Some(data_dir()?.join("profile.txt"))
 }
 
 impl Profile {
-    pub fn load() -> Self {
+    fn parse(text: &str) -> Self {
         let mut values = BTreeMap::new();
-        if let Some(text) = profile_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-            for line in text.lines() {
-                if let Some((k, v)) = line.split_once(' ') {
-                    values.insert(k.to_string(), v.to_string());
-                }
+        for line in text.lines() {
+            // keys can contain spaces (lesson names), values never do
+            if let Some((k, v)) = line.rsplit_once(' ') {
+                values.insert(k.to_string(), v.to_string());
             }
         }
         Profile { values }
+    }
+
+    pub fn load() -> Self {
+        profile_path().and_then(|p| std::fs::read_to_string(p).ok()).map_or_else(Profile::default, |t| Profile::parse(&t))
     }
 
     pub fn save(&self) {
@@ -257,7 +275,7 @@ impl Profile {
     }
 
     pub fn set(&mut self, k: &str, v: &str) {
-        self.values.insert(k.to_string(), v.to_string());
+        self.values.insert(k.to_string(), v.replace(' ', "_"));
     }
 
     pub fn number(&self, k: &str) -> Option<f32> {
@@ -270,5 +288,21 @@ impl Profile {
 
     pub fn set_setup(&mut self, s: &FreeSetup) {
         s.save(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_keys_with_spaces_round_trip() {
+        let mut p = Profile::default();
+        p.set("best.Night ILS: 737", "112");
+        p.set("grade.Night ILS: 737", "A+");
+        let text: String = p.values.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+        let q = Profile::parse(&text);
+        assert_eq!(q.number("best.Night ILS: 737"), Some(112.0));
+        assert_eq!(q.get("grade.Night ILS: 737"), Some("A+"));
     }
 }

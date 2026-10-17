@@ -2,6 +2,9 @@
 
 mod airliner;
 mod ap;
+mod debrief;
+mod ghost;
+mod progress;
 mod atc;
 mod audio;
 mod camera;
@@ -12,6 +15,9 @@ mod gpws;
 mod ground;
 mod hud;
 mod input;
+mod kids;
+mod music;
+mod toys;
 mod lessons;
 mod lights;
 mod mesh;
@@ -58,8 +64,17 @@ enum Screen {
 #[derive(Clone, Copy)]
 enum MenuAct {
     Lesson(usize),
+    Objectives,
     Setup,
-    Quit,
+    Kids,
+    Red,
+}
+
+/// The main menu has two entries; Objectives opens the list of lessons and challenges.
+#[derive(Clone, Copy, PartialEq)]
+enum MenuPage {
+    Main,
+    Objectives,
 }
 
 #[derive(Default)]
@@ -83,6 +98,7 @@ struct App {
     screen: Screen,
     /// Selected row of the main menu (or of the setup screen).
     sel: usize,
+    menu_page: MenuPage,
     setup_sel: usize,
     profile: setup::Profile,
     free: setup::FreeSetup,
@@ -132,6 +148,23 @@ struct App {
     traffic: traffic::Traffic,
     /// Traffic flies in free flight only.
     traffic_on: bool,
+    /// This attempt, recorded in case it's a new best.
+    run: ghost::Run,
+    /// The best attempt so far on this challenge, flown alongside.
+    ghost: Option<ghost::Run>,
+    ghost_ac: Option<Aircraft>,
+    show_ghost: bool,
+    ghost_visible: bool,
+    /// Simulation time when the attempt finished.
+    done_at: f32,
+    approach: debrief::ApproachLog,
+    debrief: Option<debrief::Debrief>,
+    /// Stars earned on the attempt just finished, out of how many.
+    result_stars: Option<(u32, u32)>,
+    /// Kids mode, when that's what's flying.
+    kids: Option<kids::Kids>,
+    /// 99 Red Balloons' music, loaded the first time it's needed.
+    song: Option<std::sync::Arc<music::Song>>,
 }
 
 /// A puff of tire smoke or dust drifting and spreading out.
@@ -142,6 +175,8 @@ struct Smoke {
     life: f32,
     size: f32,
     color: [f32; 3],
+    /// How thick it starts out (most smoke is 0.55).
+    opacity: f32,
 }
 
 fn key_any(keys: &[KeyCode]) -> bool {
@@ -161,6 +196,21 @@ fn ease(cur: f32, target: f32, rise: f32, dt: f32) -> f32 {
 /// Stick shaping: soft around centre for fine corrections, full travel at the edges.
 fn expo(x: f32, amount: f32) -> f32 {
     x * (1.0 - amount) + x * x * x * amount
+}
+
+/// A bright rainbow colour, `h` from 0 to 1 round the colour wheel.
+fn rainbow(h: f32) -> [f32; 3] {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    let c = match h as i32 {
+        0 => [1.0, x, 0.0],
+        1 => [x, 1.0, 0.0],
+        2 => [0.0, 1.0, x],
+        3 => [0.0, x, 1.0],
+        4 => [x, 0.0, 1.0],
+        _ => [1.0, 0.0, x],
+    };
+    c.map(|v| 0.15 + 0.85 * v)
 }
 
 fn make_minimap(world: &World) -> Texture2D {
@@ -284,18 +334,93 @@ impl App {
         }
         self.prev_pos = self.ac.pos;
         self.acc = 0.0;
+        self.run = ghost::Run::default();
+        self.approach = debrief::ApproachLog::default();
+        self.debrief = None;
+        self.result_stars = None;
+        let lesson = &self.lessons[idx];
+        self.ghost = matches!(lesson.kind, Kind::Rings | Kind::Landing).then(|| ghost::load(lesson.name)).flatten();
+        self.ghost_ac = self.ghost.as_ref().map(|_| Aircraft::in_flight(craft, self.ac.pos, 90.0, 100.0, 0.0, 0));
     }
 
-    /// The main menu: lessons, challenges and free flight, with what each row does.
+    fn stars_total(&self) -> u32 {
+        progress::total(&self.lessons, &self.profile, &self.world).0
+    }
+
+    fn lesson_locked(&self, i: usize) -> Option<u32> {
+        let earned = self.stars_total();
+        let craft = self.lessons[i].craft;
+        (!progress::unlocked(craft, earned, &self.profile)).then(|| progress::unlock_at(craft) - earned)
+    }
+
+    /// Save a finished attempt's stars and say what it unlocked.
+    fn award(&mut self, earned: u32, max: u32, before: u32) {
+        self.result_stars = Some((earned, max));
+        let after = self.stars_total();
+        for (craft, name) in setup::AIRCRAFT {
+            let at = progress::unlock_at(craft);
+            if before < at && after >= at && self.profile.get("unlock_all").is_none() {
+                self.mission.summary.push(String::new());
+                self.mission.summary.push(format!("Unlocked: {name}! You'll find it in Objectives and Free Fly."));
+                self.audio.chime();
+            }
+        }
+    }
+
+    /// The main menu (objectives, free fly) or the objectives, with what each row does.
     fn menu_rows(&self) -> (Vec<hud::MenuRow>, Vec<Option<MenuAct>>) {
-        use hud::MenuRow::*;
+        use hud::{MenuItem, MenuRow::*};
         let mut rows = Vec::new();
         let mut acts = Vec::new();
         let mut push = |r: hud::MenuRow, a: Option<MenuAct>| {
             rows.push(r);
             acts.push(a);
         };
-        let done = |name: &str| self.profile.get(&format!("done.{name}")).is_some();
+        let (earned, possible) = progress::total(&self.lessons, &self.profile, &self.world);
+        if self.menu_page == MenuPage::Main {
+            push(
+                Item(MenuItem {
+                    name: "Objectives".into(),
+                    blurb: "Guided lessons, then landing and racing challenges. Earn stars to unlock new aircraft.".into(),
+                    stars: Some((earned, possible)),
+                    ..Default::default()
+                }),
+                Some(MenuAct::Objectives),
+            );
+            let next = setup::AIRCRAFT.iter().filter(|(c, _)| !progress::unlocked(*c, earned, &self.profile)).min_by_key(|(c, _)| progress::unlock_at(*c));
+            let craft = setup::AIRCRAFT[self.free.craft].1;
+            push(
+                Item(MenuItem {
+                    name: "Free Fly".into(),
+                    blurb: format!("Pick an aircraft, a start, the time and the weather. Last time: {craft}."),
+                    goal: next.map(|(c, n)| format!("Next unlock at {} stars: {n}", progress::unlock_at(*c))).unwrap_or_default(),
+                    ..Default::default()
+                }),
+                Some(MenuAct::Setup),
+            );
+            let popped = self.profile.number("kids.balloons").unwrap_or(0.0);
+            push(
+                Item(MenuItem {
+                    name: "Kids Mode".into(),
+                    blurb: "For little pilots: one stick, no crashing, and a friendly voice with little missions. Pop balloons, fly through rainbows, find the lighthouse, land. Planes, a helicopter and a hot air balloon.".into(),
+                    goal: if popped > 0.0 { format!("Balloons popped so far: {popped:.0}, stars: {:.0}", self.profile.number("kids.stars").unwrap_or(0.0)) } else { String::new() },
+                    ..Default::default()
+                }),
+                Some(MenuAct::Kids),
+            );
+            let best = self.profile.number("red.best");
+            let best_plane = self.profile.get("red.plane").unwrap_or("").replace('_', " ");
+            push(
+                Item(MenuItem {
+                    name: "99 Red Balloons".into(),
+                    blurb: "A speedrun along a rainbow road round the airport: 99 red balloons in a line, each one missed costs two seconds. Zoom on the straights, ease off for the turns. To an 80s new-wave beat.".into(),
+                    goal: best.map(|b| format!("Best lap: {} ({best_plane})", lessons::fmt_time(b))).unwrap_or_default(),
+                    ..Default::default()
+                }),
+                Some(MenuAct::Red),
+            );
+            return (rows, acts);
+        }
         let groups: [(&str, fn(&Lesson) -> bool); 3] = [
             ("LEARN TO FLY", |l| l.kind == Kind::Lesson && l.craft == Craft::Cessna),
             ("MORE AIRCRAFT", |l| l.kind == Kind::Lesson && l.craft != Craft::Cessna),
@@ -305,29 +430,46 @@ impl App {
             push(Header(title), None);
             for (i, l) in self.lessons.iter().enumerate().filter(|(_, l)| keep(l)) {
                 let mark = match l.kind {
-                    Kind::Rings => self.profile.number(&format!("ring.{}", l.name)).map(|b| format!("best {}", lessons::fmt_time(b))).unwrap_or_default(),
-                    Kind::Landing => match (self.profile.number(&format!("best.{}", l.name)), self.profile.get(&format!("grade.{}", l.name))) {
-                        (Some(b), Some(g)) => format!("{g}  {b:.0}"),
-                        _ => String::new(),
-                    },
-                    _ if done(l.name) => "done".into(),
-                    _ => String::new(),
+                    Kind::Rings => self.profile.number(&format!("ring.{}", l.name)).map(|b| lessons::fmt_time(b)).unwrap_or_default(),
+                    _ => self.profile.get(&format!("grade.{}", l.name)).map(|g| g.to_string()).unwrap_or_default(),
                 };
-                push(Item(l.name.into(), mark, l.blurb.into()), Some(MenuAct::Lesson(i)));
+                let locked = self.lesson_locked(i);
+                let blurb = match locked {
+                    Some(n) => format!("Earn {n} more star{} to unlock this aircraft. {}", if n == 1 { "" } else { "s" }, l.blurb),
+                    None => l.blurb.into(),
+                };
+                push(
+                    Item(MenuItem {
+                        name: l.name.into(),
+                        mark,
+                        blurb,
+                        goal: progress::goal(l, &self.world),
+                        stars: Some((progress::stars(l, &self.profile, &self.world), progress::max_stars(l))),
+                        locked,
+                    }),
+                    Some(MenuAct::Lesson(i)),
+                );
             }
         }
-        push(Header("FREE FLIGHT"), None);
-        let craft = setup::AIRCRAFT[self.free.craft].1;
-        push(Item("Free Flight".into(), String::new(), format!("Pick an aircraft, a start, the time and the weather. Last time: {craft}.")), Some(MenuAct::Setup));
-        push(Item("Quit".into(), String::new(), "See you next time!".into()), Some(MenuAct::Quit));
         (rows, acts)
     }
 
     fn to_menu(&mut self) {
         self.screen = Screen::Menu;
-        let (_, acts) = self.menu_rows();
+        // back to where the flight was picked from
         let idx = self.idx;
-        self.sel = acts.iter().position(|a| matches!(a, Some(MenuAct::Lesson(i)) if *i == idx) || matches!(a, Some(MenuAct::Setup)) && self.lessons[idx].kind == Kind::Free).unwrap_or(1);
+        if let Some(k) = self.kids.take() {
+            self.menu_page = MenuPage::Main;
+            self.sel = if k.red.is_some() { 3 } else { 2 };
+            self.audio.music(None);
+        } else if self.lessons[idx].kind == Kind::Free {
+            self.menu_page = MenuPage::Main;
+            self.sel = 1;
+        } else {
+            self.menu_page = MenuPage::Objectives;
+            let (_, acts) = self.menu_rows();
+            self.sel = acts.iter().position(|a| matches!(a, Some(MenuAct::Lesson(i)) if *i == idx)).unwrap_or(1);
+        }
         self.paused = false;
         self.ac = Aircraft::on_ground_at(Craft::Cessna, &self.world.terrain, -RWY_HALF_LEN + 25.0, 0.0, 90.0);
     }
@@ -528,7 +670,7 @@ impl App {
         // the autopilot panel takes the mouse: click a window to press it, scroll to set it
         let mut dragging = dragging;
         self.mcp_hover = None;
-        if self.screen == Screen::Flying && !self.paused && !self.help && self.ac.crashed.is_none() {
+        if self.screen == Screen::Flying && !self.paused && !self.help && self.ac.crashed.is_none() && self.kids.is_none() {
             let layout = hud::mcp_layout(self.ac.spec.is_jet(), hud::panel_top(self.panel));
             self.mcp_hover = layout.iter().find(|(_, r)| r.contains(mp)).map(|(f, _)| *f);
             if let Some(f) = self.mcp_hover {
@@ -585,19 +727,29 @@ impl App {
                 }
                 if go {
                     match acts.get(self.sel).copied().flatten() {
-                        Some(MenuAct::Lesson(i)) => self.start(i),
+                        Some(MenuAct::Lesson(i)) if self.lesson_locked(i).is_none() => self.start(i),
+                        Some(MenuAct::Lesson(_)) => {}
+                        Some(MenuAct::Objectives) => {
+                            self.menu_page = MenuPage::Objectives;
+                            let (_, acts) = self.menu_rows();
+                            self.sel = acts.iter().position(|a| a.is_some()).unwrap_or(0);
+                        }
                         Some(MenuAct::Setup) => {
                             self.screen = Screen::Setup;
                             self.setup_sel = setup::ROWS - 1;
                         }
-                        Some(MenuAct::Quit) => return false,
+                        Some(MenuAct::Kids) => self.start_kids(false),
+                        Some(MenuAct::Red) => self.start_kids(true),
                         None => {}
                     }
                     if self.screen == Screen::Flying {
                         return true;
                     }
-                }
-                if is_key_pressed(KeyCode::Escape) {
+                } else if back && self.menu_page == MenuPage::Objectives {
+                    self.menu_page = MenuPage::Main;
+                    self.sel = 0;
+                    self.audio.click();
+                } else if is_key_pressed(KeyCode::Escape) {
                     return false;
                 }
             } else {
@@ -616,7 +768,12 @@ impl App {
                     self.free.change(self.setup_sel, if right { 1 } else { -1 });
                     self.audio.click();
                 }
-                if go {
+                let locked = {
+                    let earned = self.stars_total();
+                    let c = self.free.craft();
+                    (!progress::unlocked(c, earned, &self.profile)).then(|| progress::unlock_at(c) - earned)
+                };
+                if go && locked.is_none() {
                     self.profile.set_setup(&self.free);
                     self.profile.save();
                     let i = self.lessons.iter().position(|l| l.kind == Kind::Free).unwrap_or(0);
@@ -625,6 +782,8 @@ impl App {
                 }
                 if back {
                     self.screen = Screen::Menu;
+                    self.menu_page = MenuPage::Main;
+                    self.sel = 1;
                 }
             }
             self.cam.menu(self.time, self.ac.pos);
@@ -634,14 +793,21 @@ impl App {
             self.draw_world();
             if self.screen == Screen::Menu {
                 let (rows, _) = self.menu_rows();
-                hud::menu(&rows, self.sel, self.time, self.pad.connected());
+                hud::menu(&rows, self.sel, self.time, self.pad.connected(), self.menu_page == MenuPage::Objectives);
             } else {
-                hud::setup_screen(&self.free.rows(), self.setup_sel, self.time, self.pad.connected());
+                let earned = self.stars_total();
+                let c = self.free.craft();
+                let locked = (!progress::unlocked(c, earned, &self.profile)).then(|| progress::unlock_at(c) - earned);
+                hud::setup_screen(&self.free.rows(locked), self.setup_sel, self.time, self.pad.connected());
             }
             if self.help {
                 hud::help_overlay();
             }
             return true;
+        }
+
+        if self.kids.is_some() {
+            return self.kids_frame(dt, drag, dragging, wheel, &just);
         }
 
         // ---- replay ----
@@ -683,10 +849,12 @@ impl App {
             if pressed_any(&[KeyCode::Enter, KeyCode::KpEnter]) || pad(PadBtn::South) {
                 self.summary_dismissed = true;
             }
-            if (is_key_pressed(KeyCode::N) || pad(PadBtn::North)) && self.idx + 1 < self.lessons.len() {
-                self.start(self.idx + 1);
-                self.sel = self.idx;
-                return true;
+            if is_key_pressed(KeyCode::N) || pad(PadBtn::North) {
+                let next = (self.idx + 1..self.lessons.len()).find(|&i| self.lessons[i].kind != Kind::Free && self.lesson_locked(i).is_none());
+                if let Some(i) = next {
+                    self.start(i);
+                    return true;
+                }
             }
         } else if is_key_pressed(KeyCode::N) {
             self.mission.skip_step(&self.lessons[self.idx]);
@@ -703,6 +871,10 @@ impl App {
             self.auto_rudder = !self.auto_rudder;
             self.ac.auto_rudder = self.auto_rudder;
             self.toast(if self.auto_rudder { "Auto-rudder ON" } else { "Auto-rudder OFF" });
+        }
+        if is_key_pressed(KeyCode::J) && self.ghost.is_some() {
+            self.show_ghost = !self.show_ghost;
+            self.toast(if self.show_ghost { "Ghost on" } else { "Ghost off" });
         }
         if is_key_pressed(KeyCode::U) {
             self.hud_on = !self.hud_on;
@@ -768,6 +940,19 @@ impl App {
         self.landing.update(&self.ac, &self.weather, dt);
         if running {
             self.recorder.record(&self.ac, self.sim_time);
+            if !self.mission.complete {
+                self.run.record(&self.ac, self.mission.time);
+                if self.ac.touchdown.is_none() {
+                    self.approach.record(&self.ac, self.mission.time);
+                }
+            }
+        }
+        if let (Some(g), Some(gac)) = (&self.ghost, &mut self.ghost_ac) {
+            // the ghost keeps going once you've finished, so you can watch it come in
+            let t = self.mission.time + if self.mission.complete { self.sim_time - self.done_at } else { 0.0 };
+            self.ghost_visible = self.show_ghost && g.pose(t, gac);
+        } else {
+            self.ghost_visible = false;
         }
         if self.ac.touchdown_event && self.touch_time.is_none() {
             self.touch_time = Some(self.sim_time);
@@ -795,7 +980,7 @@ impl App {
                 let a = k as f32 * 2.4;
                 let v = vec3(a.cos(), 0.6 + (k % 5) as f32 * 0.3, a.sin()) * (2.0 + (k % 7) as f32);
                 let c = if k % 3 == 0 { [0.35, 0.33, 0.3] } else { [0.62, 0.58, 0.5] };
-                self.smoke.push(Smoke { pos: self.ac.pos, vel: v, age: 0.0, life: 2.5 + (k % 4) as f32, size: 2.0, color: c });
+                self.smoke.push(Smoke { pos: self.ac.pos, vel: v, age: 0.0, life: 2.5 + (k % 4) as f32, size: 2.0, color: c, opacity: 0.55 });
             }
         }
 
@@ -821,36 +1006,83 @@ impl App {
                 }
                 Some(Event::LessonDone) => {
                     self.audio.chime();
+                    self.done_at = self.sim_time;
+                    let before = self.stars_total();
                     let lesson = &self.lessons[self.idx];
-                    let key = format!("done.{}", lesson.name);
-                    self.profile.set(&key, "1");
-                    if lesson.kind == Kind::Landing {
+                    let name = lesson.name;
+                    let max = progress::max_stars(lesson);
+                    self.profile.set(&format!("done.{name}"), "1");
+                    let mut earned = 1;
+                    let touch = (self.landing.touch, self.ac.touchdown);
+                    if let (true, Some(touch), Some(td)) = (progress::graded(lesson), touch.0, touch.1) {
                         let (lines, total, grade) = self.landing.card(self.ac.craft, &self.weather, self.weather.sky().night);
-                        let best_key = format!("best.{}", lesson.name);
-                        let best = self.profile.number(&best_key).unwrap_or(0.0);
-                        self.mission.summary = lines;
-                        if total as f32 > best {
-                            self.profile.set(&best_key, &total.to_string());
-                            self.profile.set(&format!("grade.{}", lesson.name), grade);
-                            self.mission.summary.push(format!("New personal best! (was {best:.0})"));
+                        earned = progress::grade_stars(grade);
+                        let target = debrief::target_speed(self.ac.craft, lesson.vref);
+                        self.debrief = debrief::build(&self.approach, td.pos, touch.along, self.ac.craft, target, self.weather.gust_kt, !self.ac.spec.has_engine() || self.ac.engine_failed);
+                        let best_key = format!("best.{name}");
+                        let best = self.profile.number(&best_key);
+                        // the last best run's touchdown, to compare against
+                        let prev: Vec<f32> = self.profile.get(&format!("run.{name}")).map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                        if lesson.kind == Kind::Landing {
+                            self.mission.summary = lines;
                         } else {
-                            self.mission.summary.push(format!("Personal best: {best:.0}"));
+                            self.mission.summary.push(String::new());
+                            self.mission.summary.push(format!("Landing grade {grade} - {total} points"));
+                        }
+                        if best.map_or(true, |b| total as f32 > b) {
+                            self.profile.set(&best_key, &total.to_string());
+                            self.profile.set(&format!("grade.{name}"), grade);
+                            self.profile.set(&format!("run.{name}"), &format!("{:.0},{:.0}", touch.sink_fpm, touch.along));
+                            if let Some(b) = best {
+                                self.mission.summary.push(format!("New personal best! (was {b:.0})"));
+                            }
+                            if lesson.kind == Kind::Landing {
+                                ghost::save(name, &self.run);
+                            }
+                        } else if let Some(b) = best {
+                            let mut line = format!("Personal best: {b:.0}");
+                            if let [sink, along] = prev[..] {
+                                let d = touch.sink_fpm - sink;
+                                line += &format!(" ({sink:.0} fpm, {along:.0} m in) - this time {:.0} fpm {}", d.abs(), if d > 0.0 { "firmer" } else { "softer" });
+                            }
+                            self.mission.summary.push(line);
                         }
                     }
+                    self.award(earned, max, before);
                     self.profile.save();
                 }
                 Some(Event::Ring) => {
                     let n = self.mission.next_ring;
                     self.audio.ring(n);
-                    self.toast(format!("Ring {n}/{}", self.world.rings.len()));
+                    self.run.splits.push(self.mission.time);
+                    // split against the ghost's time at the same ring
+                    let split = self.ghost.as_ref().and_then(|g| g.splits.get(n - 1)).map(|b| self.mission.time - b);
+                    match split {
+                        Some(d) => self.toast(format!("Ring {n}/{}   {}{:.1} s", self.world.rings.len(), if d < 0.0 { "-" } else { "+" }, d.abs())),
+                        None => self.toast(format!("Ring {n}/{}", self.world.rings.len())),
+                    }
                 }
                 Some(Event::RingsDone) => {
                     self.audio.chime();
-                    if let Some(b) = self.best_ring {
-                        let key = format!("ring.{}", self.lessons[self.idx].name);
-                        self.profile.set(&key, &b.to_string());
-                        self.profile.save();
+                    self.done_at = self.sim_time;
+                    let before = self.stars_total();
+                    let lesson = &self.lessons[self.idx];
+                    let name = lesson.name;
+                    let pars = progress::ring_pars(&self.world, lesson.craft);
+                    let key = format!("ring.{name}");
+                    let prev = self.profile.number(&key);
+                    if prev.map_or(true, |p| self.mission.time < p) {
+                        self.profile.set(&key, &self.mission.time.to_string());
+                        self.run.splits.push(self.mission.time);
+                        ghost::save(name, &self.run);
                     }
+                    let earned = progress::ring_stars(self.mission.time, pars);
+                    if earned < 3 {
+                        let next = if earned == 1 { pars.1 } else { pars.0 };
+                        self.mission.summary.push(format!("Next star: under {}", lessons::fmt_time(next)));
+                    }
+                    self.award(earned, 3, before);
+                    self.profile.save();
                 }
                 None => {}
             }
@@ -871,6 +1103,326 @@ impl App {
         true
     }
 
+    /// Kids mode (or 99 Red Balloons): a sunny, calm day, lined up on the runway.
+    fn start_kids(&mut self, red: bool) {
+        self.idx = self.lessons.iter().position(|l| l.kind == Kind::Free).unwrap_or(0);
+        self.mission = Mission::default();
+        self.weather = weather::Weather { wind_kt: 0.0, gust_kt: 0.0, turbulence: 0.0, clouds: 0.35, hour: 11.0, thermals: 0.0, ..Default::default() };
+        self.traffic_on = true;
+        let seed = (self.time * 1000.0) as u64;
+        // keep the plane picked last time when playing again
+        let vehicle = self.kids.as_ref().map_or(0, |k| k.vehicle);
+        let mut k = if red { kids::Kids::red_balloons(&self.world.terrain, seed) } else { kids::Kids::new(&self.world.terrain, seed) };
+        k.vehicle = vehicle;
+        self.ac = k.spawn(&self.world.terrain);
+        if red {
+            // a golden evening for the rainbow road, and the sky to yourself
+            self.weather.hour = 18.4;
+            self.weather.clouds = 0.25;
+            self.traffic_on = false;
+            let gl = unsafe { get_internal_gl() };
+            self.renderer.set_road(gl.quad_context, &k.course);
+        }
+        self.kids = Some(k);
+        self.cam.mode = CamMode::Chase;
+        self.cam.reset(&self.ac);
+        self.screen = Screen::Flying;
+        self.paused = false;
+        self.help = false;
+        self.toasts.clear();
+        self.smoke.clear();
+        self.replay = None;
+        self.ghost = None;
+        self.ghost_ac = None;
+        self.ghost_visible = false;
+        self.prev_pos = self.ac.pos;
+        if red {
+            let song = self.song.get_or_insert_with(|| std::sync::Arc::new(music::load())).clone();
+            self.audio.music(Some(song));
+        } else {
+            self.audio.music(None);
+            self.audio.kid(audio::Line::Go, false);
+        }
+    }
+
+    /// Kids mode's places to find: the windmills, the lighthouse and a sailing boat.
+    fn landmarks(&self) -> [Vec3; 3] {
+        let t = &self.world.terrain;
+        let l = LIGHTHOUSE;
+        let (pier, dir) = scenery::pier(t);
+        let boat = scenery::boats(self.time, pier, dir).first().map_or(Vec3::ZERO, |b| b.1.w_axis.truncate()) + Vec3::Y * 8.0;
+        [self.world.turbines[3] + Vec3::Y * 82.0, vec3(l.0, t.height(l.0, l.1) + 32.0, l.1), boat]
+    }
+
+    /// A burst of puffs flying apart from `pos`.
+    fn burst(&mut self, pos: Vec3, n: usize, speed: f32, colors: &[[f32; 3]]) {
+        for k in 0..n {
+            // spread evenly over a sphere
+            let y = 1.0 - 2.0 * (k as f32 + 0.5) / n as f32;
+            let a = k as f32 * 2.39996;
+            let r = (1.0 - y * y).sqrt();
+            let v = vec3(a.cos() * r, y, a.sin() * r) * speed * (0.7 + 0.3 * ((k * 7) % 5) as f32 / 4.0);
+            self.smoke.push(Smoke { pos, vel: v, age: 0.0, life: 0.9 + (k % 3) as f32 * 0.3, size: 1.2, color: colors[k % colors.len()], opacity: 0.8 });
+        }
+    }
+
+    /// Add one to a kids-mode tally in the profile and return the new count.
+    fn tally(&mut self, key: &str) -> u32 {
+        let n = self.profile.number(key).unwrap_or(0.0) as u32 + 1;
+        self.profile.set(key, &n.to_string());
+        self.profile.save();
+        n
+    }
+
+    /// Kids mode: one stick (pull back to climb), a zoom button, rainbow smoke and a change of
+    /// plane; the missions talk to you.
+    fn kids_frame(&mut self, dt: f32, drag: Vec2, dragging: bool, wheel: f32, just: &[PadBtn]) -> bool {
+        use audio::Line;
+        use KeyCode::*;
+        let pad = |b: PadBtn| just.contains(&b);
+        self.help = false;
+        if is_key_pressed(Escape) || pad(PadBtn::Start) {
+            self.to_menu();
+            return true;
+        }
+        // 99 Red Balloons: R (or B) starts again, any time
+        if self.kids.as_ref().is_some_and(|k| k.red.is_some()) && (is_key_pressed(R) || pad(PadBtn::East)) {
+            self.start_kids(true);
+            return true;
+        }
+        let axis = |pos: bool, neg: bool| pos as i32 as f32 - neg as i32 as f32;
+        let p = &self.pad;
+        // like a real plane: pull back (the stick down, or the down arrow) to climb
+        let mut y = axis(key_any(&[Down, S]), key_any(&[Up, W])) - p.axis(PadAxis::LeftStickY);
+        if self.invert {
+            y = -y;
+        }
+        let x = axis(key_any(&[Right, D]), key_any(&[Left, A])) + p.axis(PadAxis::LeftStickX) + p.axis(PadAxis::RightStickX);
+        let zoom = key_any(&[Space, LeftShift, RightShift]) || p.down(PadBtn::South) || p.value(PadBtn::RightTrigger2) > 0.3;
+        let input = kids::Input { x: x.clamp(-1.0, 1.0), y: y.clamp(-1.0, 1.0), zoom };
+        let marks = self.landmarks();
+        let k = self.kids.as_mut().unwrap();
+        if is_key_pressed(I) {
+            self.invert = !self.invert;
+            k.say(if self.invert { "Push to climb" } else { "Pull to climb" });
+        }
+        if is_key_pressed(X) || pad(PadBtn::West) {
+            k.rainbow_smoke = !k.rainbow_smoke;
+            self.audio.click();
+        }
+        // (in 99 Red Balloons, only at the start gate)
+        let can_switch = k.red.as_ref().map_or(true, |r| !r.started);
+        if !can_switch && (is_key_pressed(P) || is_key_pressed(Tab) || pad(PadBtn::North)) {
+            k.say(if self.pad.connected() { "Pick the plane at the start: B restarts" } else { "Pick the plane at the start: R restarts" });
+        }
+        if can_switch && (is_key_pressed(P) || is_key_pressed(Tab) || pad(PadBtn::North)) {
+            self.ac = k.next_vehicle(&self.ac, &self.world.terrain);
+            k.say(kids::VEHICLES[k.vehicle].1);
+            self.cam.reset(&self.ac);
+            self.audio.ding();
+            let line = match k.kind() {
+                kids::Vehicle::Plane(Craft::Cessna) => Line::Plane,
+                kids::Vehicle::Plane(Craft::Jet) => Line::Jet,
+                kids::Vehicle::Plane(Craft::Fighter) => Line::Fighter,
+                kids::Vehicle::Plane(Craft::Glider) => Line::Glider,
+                kids::Vehicle::Toy(render::ToyKind::Helicopter) => Line::Heli,
+                kids::Vehicle::Toy(render::ToyKind::HotAir) => Line::HotAir,
+            };
+            self.audio.kid(line, true);
+        }
+        let prev = self.ac.pos;
+        let events = k.update(&mut self.ac, &input, &self.world.terrain, &marks, self.time, dt);
+
+        // rainbow smoke from the tail, a puff every few metres
+        if k.rainbow_smoke && !k.on_ground {
+            let moved = self.ac.pos - prev;
+            let tail = match k.toy() {
+                Some(render::ToyKind::Helicopter) => -self.ac.forward() * 7.0 + self.ac.up() * 1.0,
+                // from under the basket
+                Some(render::ToyKind::HotAir) => -self.ac.up() * (self.ac.spec.rest_height + 0.5),
+                None => -self.ac.forward() * (self.ac.spec.span * 0.3 + 2.0),
+            };
+            k.smoke_acc += moved.length();
+            while k.smoke_acc > 2.5 {
+                k.smoke_acc -= 2.5;
+                k.hue = (k.hue + 0.01).fract();
+                let back = k.smoke_acc / moved.length().max(1e-3);
+                let pos = self.ac.pos - moved * back + tail;
+                self.smoke.push(Smoke { pos, vel: Vec3::ZERO, age: 0.0, life: 3.5, size: 1.6, color: rainbow(k.hue), opacity: 0.85 });
+            }
+        }
+        let confetti: Vec<[f32; 3]> = (0..6).map(|i| rainbow(i as f32 / 6.0)).collect();
+        for e in events {
+            match e {
+                kids::Event::Pop(pos, c, n) => {
+                    let k = self.kids.as_mut().unwrap();
+                    let popped = k.progress;
+                    self.audio.pop(n.unwrap_or(popped));
+                    if let Some(n) = n {
+                        self.audio.kid(Line::Count(n as u8), true);
+                    }
+                    // 99 Red Balloons: a cheer every ten
+                    if k.red.is_some() && popped % 10 == 0 && popped < kids::RED_TOTAL {
+                        k.say(format!("{popped}!"));
+                        self.audio.ding();
+                    }
+                    self.tally("kids.balloons");
+                    self.burst(pos, 18, 14.0, &[[c[0], c[1], c[2]], [1.0, 1.0, 1.0]]);
+                }
+                kids::Event::Rainbow(pos, n) => {
+                    self.audio.ring(n);
+                    self.burst(pos, 30, 16.0, &confetti);
+                }
+                kids::Event::NewQuest(q) => {
+                    let (line, words) = match q {
+                        kids::Quest::Balloons => (Line::Balloons, "Pop the balloons!"),
+                        kids::Quest::Rainbows => (Line::Rainbows, "Fly through the rainbows!"),
+                        kids::Quest::Find(kids::Landmark::Windmills) => (Line::Windmills, "Find the windmills!"),
+                        kids::Quest::Find(kids::Landmark::Lighthouse) => (Line::Lighthouse, "Find the lighthouse!"),
+                        kids::Quest::Find(kids::Landmark::Boat) => (Line::Boat, "Find the boat!"),
+                        kids::Quest::Land => (Line::Land, "Time to land!"),
+                    };
+                    self.audio.kid(line, false);
+                    self.kids.as_mut().unwrap().say(words);
+                }
+                kids::Event::QuestDone(q) => {
+                    self.audio.chime();
+                    let n = self.tally("kids.stars");
+                    self.burst(self.ac.pos + Vec3::Y * 8.0, 60, 12.0, &confetti);
+                    let cheers = [Line::Yay, Line::Hooray, Line::Great, Line::DidIt];
+                    match q {
+                        kids::Quest::Find(_) => self.audio.kid(Line::Found, false),
+                        // the landing has its own cheer
+                        kids::Quest::Land => {}
+                        _ => self.audio.kid(cheers[n as usize % cheers.len()], false),
+                    }
+                    self.kids.as_mut().unwrap().say(match q {
+                        kids::Quest::Find(_) => "You found it!",
+                        kids::Quest::Land => "You landed!",
+                        _ => "Yay!",
+                    });
+                }
+                kids::Event::Liftoff => self.audio.kid(Line::Up, false),
+                kids::Event::Touchdown => {
+                    self.audio.touchdown(150.0);
+                    self.wheel_smoke(8, [0.9, 0.9, 0.88]);
+                }
+                kids::Event::Missed => {
+                    self.audio.click();
+                    self.kids.as_mut().unwrap().say(format!("+{:.0} s", kids::MISS_PENALTY));
+                }
+                kids::Event::RedDone(time, popped) => {
+                    self.audio.chime();
+                    self.audio.kid(if popped == kids::RED_TOTAL { Line::Hooray } else { Line::Great }, false);
+                    // the fastest lap (missed balloons cost time)
+                    let best = self.profile.number("red.best");
+                    let record = best.map_or(true, |b| time < b);
+                    if record {
+                        let plane = kids::VEHICLES[self.kids.as_ref().unwrap().vehicle].1;
+                        self.profile.set("red.best", &time.to_string());
+                        self.profile.set("red.popped", &popped.to_string());
+                        self.profile.set("red.plane", plane);
+                        self.profile.save();
+                    }
+                    // fireworks all round
+                    for k in 0..6 {
+                        let a = k as f32 * 1.05;
+                        let at = self.ac.pos + vec3(a.cos() * 40.0, 20.0 + (k % 3) as f32 * 15.0, a.sin() * 40.0);
+                        self.burst(at, 40, 16.0, &confetti);
+                    }
+                    let k = self.kids.as_mut().unwrap();
+                    let t = lessons::fmt_time(time);
+                    k.say(match (popped == kids::RED_TOTAL, record && best.is_some()) {
+                        (true, true) => format!("All 99! New best: {t}"),
+                        (true, false) => format!("All 99 in {t}!"),
+                        (false, true) => format!("New best: {t}"),
+                        (false, false) => format!("{popped} of 99: {t}"),
+                    });
+                }
+                kids::Event::Landed => {
+                    self.audio.kid(Line::Landed, false);
+                    self.tally("kids.landings");
+                    self.burst(self.ac.pos + Vec3::Y * 6.0, 48, 10.0, &confetti);
+                }
+            }
+        }
+
+        self.update_smoke(dt);
+        self.cam.update(&self.ac, &self.world.terrain, dt, drag, dragging, wheel);
+        if let Some((eye, target)) = self.shot_cam {
+            self.cam.set_fixed(eye, target);
+        }
+        let k = self.kids.as_ref().unwrap();
+        let ac = &self.ac;
+        let toy = k.toy();
+        let jet = ac.spec.is_jet() && toy.is_none();
+        let engine = toy.is_none() && ac.spec.has_engine();
+        self.audio.update(audio::State {
+            rpm: if !engine { 0.0 } else if jet { 1.0 } else { 700.0 + 1900.0 * ac.ctl.throttle + ac.ias * 6.0 },
+            throttle: ac.ctl.throttle,
+            airspeed: ac.ias,
+            roll_speed: if ac.on_ground && toy.is_none() { ac.ias } else { 0.0 },
+            flap_deg: ac.flap_deg,
+            distance: (self.cam.eye - ac.pos).length(),
+            volume: 0.9,
+            jet,
+            n1: ac.n1,
+            reverser: ac.reverser,
+            gear: ac.gear,
+            fan_hz: ac.spec.fan_hz,
+            burner: ac.burner,
+            rotor: if toy == Some(render::ToyKind::Helicopter) { if k.on_ground { 0.35 } else { 1.0 } } else { 0.0 },
+            flame: k.flame,
+            ..Default::default()
+        });
+        self.prev_pos = self.ac.pos;
+
+        self.draw_world();
+        hud::cloud_fade(self.world.cloud_density(self.cam.eye));
+        let k = self.kids.as_ref().unwrap();
+        let view = self.cam.view(screen_width() / screen_height());
+        let target = k.target(self.ac.pos, self.time, &marks).map(|(p, c)| (p, Color::new(c[0], c[1], c[2], 1.0)));
+        let pad_on = self.pad.connected();
+        let red_done = k.red.as_ref().is_some_and(|r| r.done.is_some());
+        let red_waiting = k.red.as_ref().is_some_and(|r| !r.started);
+        let hint = if red_done {
+            Some(if pad_on { "Press B to go again" } else { "Press R to go again" })
+        } else if red_waiting {
+            Some(if pad_on { "Move the stick to go!   (Y picks the plane)" } else { "Press an arrow to go!   (P picks the plane)" })
+        } else if k.on_ground && k.speed < 0.5 {
+            Some(if pad_on { "Pull back on the stick to fly!" } else { "Press DOWN to fly!" })
+        } else if k.landing {
+            Some("Landing - let go of the stick!")
+        } else if k.toy().is_some() && k.quest == kids::Quest::Land && k.between.is_none() {
+            Some(if pad_on { "Push the stick forward to land" } else { "Hold UP to land" })
+        } else {
+            None
+        };
+        hud::kids(&hud::KidsHud {
+            view_proj: view.view_proj,
+            eye: view.eye,
+            time: self.time,
+            quest: k.quest,
+            progress: k.progress,
+            colors: &k.progress_colors,
+            done: k.red.as_ref().map_or(k.between, |r| r.done),
+            red: k.red.as_ref().map(|r| hud::RedHud {
+                popped: k.progress,
+                missed: r.missed,
+                time: r.total(),
+                best: self.profile.number("red.best"),
+            }),
+            track: k.red.as_ref().map(|r| (&k.course[..], self.ac.pos, self.ac.heading_deg(), k.balloons.iter().skip(r.next).filter(|b| !b.popped).map(|b| b.pos).collect())),
+            stars: self.profile.number("kids.stars").unwrap_or(0.0) as u32,
+            target,
+            banner: k.banner.as_ref().map(|(s, a)| (s.as_str(), *a)),
+            hint,
+            plane: kids::VEHICLES[k.vehicle].1,
+            pad: pad_on,
+        });
+        true
+    }
+
     /// Puffs from both main wheels.
     fn wheel_smoke(&mut self, n: usize, color: [f32; 3]) {
         let ac = &self.ac;
@@ -882,7 +1434,7 @@ impl App {
             let spread = vec3(((k * 7) % 5) as f32 - 2.0, 1.0 + (k % 3) as f32 * 0.5, ((k * 3) % 5) as f32 - 2.0) * 0.5 * scale;
             // the puff is left behind: it starts at a fraction of the plane's speed
             let vel = ac.vel * 0.15 + spread;
-            self.smoke.push(Smoke { pos, vel, age: 0.0, life: (1.2 + (k % 4) as f32 * 0.3) * scale, size: 0.6 * scale, color });
+            self.smoke.push(Smoke { pos, vel, age: 0.0, life: (1.2 + (k % 4) as f32 * 0.3) * scale, size: 0.6 * scale, color, opacity: 0.55 });
         }
     }
 
@@ -996,6 +1548,8 @@ impl App {
             fan_hz: ac.spec.fan_hz,
             burner: ac.burner,
             vario: (!ac.spec.has_engine()).then_some(t.vario),
+            rotor: 0.0,
+            flame: 0.0,
         });
     }
 
@@ -1023,20 +1577,26 @@ impl App {
             .iter()
             .map(|p| {
                 let f = p.age / p.life;
-                let a = 0.55 * (1.0 - f) * (f * 8.0).min(1.0);
+                // thin out right in front of the camera (flying through your own smoke)
+                let near = smoothstep(2.0, 12.0, (p.pos - self.cam.eye).length() - p.size);
+                let a = p.opacity * (1.0 - f) * (p.age * 7.0).min(1.0) * near;
                 Puff { pos: p.pos, size: p.size, color: [p.color[0], p.color[1], p.color[2], a] }
             })
             .collect();
         let sky = self.weather.sky();
         let ac = &self.ac;
         // landing lights: on with the gear down below 10,000 ft, or at night
-        let lamp = (self.screen == Screen::Flying && ac.crashed.is_none() && (ac.gear > 0.9 && agl < 3000.0 || sky.night > 0.3) && (ac.spec.is_jet() || sky.night > 0.3))
+        // (not on the rainbow road, where it lights up the road like a ghost balloon)
+        let on_road = self.kids.as_ref().is_some_and(|k| k.red.is_some());
+        let lamp = (self.screen == Screen::Flying && !on_road && ac.crashed.is_none() && (ac.gear > 0.9 && agl < 3000.0 || sky.night > 0.3) && (ac.spec.is_jet() || sky.night > 0.3))
             .then(|| (ac.pos + ac.forward() * (ac.spec.span * 0.1) - ac.up() * 0.6, (ac.forward() - ac.up() * 0.07).normalize()));
         let w = &self.weather;
         let cumulus = ((w.clouds * 1.6).min(1.0), w.cloud_base_ft * flight::FT - 1450.0);
         // the aircraft's own lights and the PAPI glow
         let mut lamps = Vec::new();
-        lights::aircraft_lamps(&self.ac, &mut lamps);
+        if self.kids.as_ref().map_or(true, |k| k.toy().is_none()) {
+            lights::aircraft_lamps(&self.ac, &mut lamps);
+        }
         let traffic: &[Aircraft] = if self.traffic_on { &self.traffic.aircraft } else { &[] };
         for a in traffic {
             lights::aircraft_lamps(a, &mut lamps);
@@ -1046,10 +1606,38 @@ impl App {
             lamps.push(lights::Lamp { pos: *p + vec3(0.0, 1.0, 0.0), col: c, size: 1.5, blink: lights::Blink::Steady, facing: None, day: true });
         }
         let wind = self.weather.steady_wind(10.0);
+        let balloons = self.kids.as_ref().map(|k| k.balloons.iter().filter(|b| !b.popped).map(|b| (b.at(self.time), b.color)).collect()).unwrap_or_default();
+        let toy = self.kids.as_ref().and_then(|k| {
+            let kind = k.toy()?;
+            let ac = &self.ac;
+            Some(render::Toy { kind, model: Mat4::from_rotation_translation(ac.rot, ac.pos - ac.up() * ac.spec.rest_height), rotor: k.rotor, flame: k.flame })
+        });
+        if let Some(k) = self.kids.as_ref().filter(|k| k.red.is_some()) {
+            // rainbow arches over the start and the finish of the road
+            for (i, j) in [(0usize, 8usize), (k.course.len() - 1, k.course.len() - 9)] {
+                let (p, q) = (k.course[i], k.course[j]);
+                let normal = if i == 0 { q - p } else { p - q }.normalize();
+                for (b, c) in kids::COLORS.iter().enumerate() {
+                    rings.push(RingDraw { pos: p + Vec3::Y * 4.0, normal, radius: 26.0 * (1.0 - b as f32 * 0.07), color: *c });
+                }
+            }
+        }
+        if let Some(k) = &self.kids {
+            // rainbow rings: six bands each, red outside
+            for r in k.rainbows.iter().filter(|r| !r.done) {
+                for (i, c) in kids::COLORS.iter().enumerate() {
+                    rings.push(RingDraw { pos: r.pos, normal: r.normal, radius: r.radius * (1.0 - i as f32 * 0.075), color: *c });
+                }
+            }
+        }
         let scene = Scene {
+            road: self.kids.as_ref().is_some_and(|k| k.red.is_some()),
+            toy,
+            balloons,
             ac: &self.ac,
             wind,
             traffic,
+            ghost: if self.ghost_visible { self.ghost_ac.as_ref() } else { None },
             lamps: &lamps,
             sky: &sky,
             lamp,
@@ -1119,7 +1707,8 @@ impl App {
                 (false, true) => "ENTER keep flying    N next    R retry    SPACE replay    ESC menu",
                 (false, false) => "ENTER keep flying    R retry    SPACE replay    ESC menu",
             };
-            hud::dialog(title, hud::GREEN_C, &self.mission.summary, footer);
+            let ex = hud::Extras { stars: self.result_stars, chart: self.debrief.as_ref() };
+            hud::dialog_ex(title, hud::GREEN_C, &self.mission.summary, footer, &ex);
         } else if self.paused {
             let footer = if pad { "START  resume    X  restart    R-stick  replay    B  main menu" } else { "ESC / P  resume    SPACE  replay    BACKSPACE  main menu    H  help" };
             hud::dialog("PAUSED", hud::AMBER, &["Take a breather.".to_string()], footer);
@@ -1155,7 +1744,8 @@ async fn main() {
         audio,
         lessons,
         screen: Screen::Menu,
-        sel: 1,
+        sel: 0,
+        menu_page: MenuPage::Main,
         setup_sel: 0,
         free: profile.setup(),
         best_ring: profile.number("best_ring"),
@@ -1197,8 +1787,24 @@ async fn main() {
         tower: atc::Tower::default(),
         traffic,
         traffic_on: false,
+        run: ghost::Run::default(),
+        ghost: None,
+        ghost_ac: None,
+        show_ghost: true,
+        ghost_visible: false,
+        done_at: 0.0,
+        approach: debrief::ApproachLog::default(),
+        debrief: None,
+        result_stars: None,
+        kids: None,
+        song: None,
     };
 
+    // --unlock-all opens every aircraft for good (it's saved in the profile)
+    if args.iter().any(|a| a == "--unlock-all") {
+        app.profile.set("unlock_all", "1");
+        app.profile.save();
+    }
     let mut frames = 0;
     if let Some((_, Some(scene), cam)) = &shot {
         request_new_screen_size(1280.0, 800.0);
@@ -1207,6 +1813,13 @@ async fn main() {
             app.start(i);
         } else if scene == "setup" {
             app.screen = Screen::Setup;
+        } else if scene == "kids" {
+            app.start_kids(false);
+        } else if scene == "red" {
+            app.start_kids(true);
+        } else if scene == "objectives" {
+            app.menu_page = MenuPage::Objectives;
+            app.sel = 1;
         }
         // extra key=value arguments set the weather: hour=19.5 clouds=0.8 wind=15 from=30 vis=8
         for a in &args {
@@ -1252,6 +1865,40 @@ async fn main() {
                         app.ac.n1 = 1.0;
                         app.ac.burner = 1.0;
                     }
+                    "sel" => app.sel = v as usize,
+                    // kids mode: in the air this far short of the first balloon, heading east
+                    "kids" => {
+                        if let Some(k) = &mut app.kids {
+                            let b = k.balloons[0].pos;
+                            k.fly_from(&mut app.ac, b - vec3(v, 6.0, 8.0), 90.0);
+                            if let Some(r) = &mut k.red {
+                                r.started = true;
+                            }
+                            app.cam.reset(&app.ac);
+                        }
+                    }
+                    // kids mode: fly vehicle N, on mission N
+                    "vehicle" => {
+                        if let Some(k) = &mut app.kids {
+                            for _ in 0..v as usize {
+                                app.ac = k.next_vehicle(&app.ac, &app.world.terrain);
+                            }
+                            app.cam.reset(&app.ac);
+                        }
+                    }
+                    "quest" => {
+                        let marks = app.landmarks();
+                        if let Some(k) = &mut app.kids {
+                            k.jump_to(v as usize, &app.world.terrain, &app.ac, &marks);
+                        }
+                    }
+                    // kids mode: on approach to runway 09, this far out
+                    "kidsland" => {
+                        if let Some(k) = &mut app.kids {
+                            k.fly_from(&mut app.ac, vec3(-RWY_HALF_LEN - v, RWY_ELEV + 30.0 + v * 0.06, 25.0), 90.0);
+                            app.cam.reset(&app.ac);
+                        }
+                    }
                     // engage the autopilot (and autothrottle, approach mode)
                     "ap" => {
                         app.ap.sync(&app.ac);
@@ -1273,8 +1920,12 @@ async fn main() {
         app.cam.reset(&app.ac);
     }
 
+    // speed=4 runs the simulation faster, frames=N picks the frame to capture
+    let arg = |k: &str| args.iter().find_map(|a| a.strip_prefix(k)?.strip_prefix('=')?.parse::<f32>().ok());
+    let speed = arg("speed").unwrap_or(1.0);
+    let capture = arg("frames").map_or(150, |f| f as u32);
     loop {
-        let dt = get_frame_time().min(0.1);
+        let dt = get_frame_time().min(0.1) * if shot.is_some() { speed } else { 1.0 };
         if !app.frame(dt) {
             break;
         }
@@ -1286,7 +1937,7 @@ async fn main() {
             app.replay = app.recorder.replay(25.0, app.touch_time);
         }
         if let Some((Some(path), _, _)) = &shot {
-            if frames == 150 {
+            if frames == capture {
                 get_screen_data().export_png(path);
                 break;
             }

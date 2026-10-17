@@ -335,7 +335,25 @@ pub struct Puff {
     pub color: [f32; 4],
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ToyKind {
+    Helicopter,
+    HotAir,
+}
+
+/// Kids mode's helicopter or hot air balloon, drawn in place of the aircraft.
+pub struct Toy {
+    pub kind: ToyKind,
+    /// Placement of its base (skids / basket bottom).
+    pub model: Mat4,
+    /// Rotor angle, radians.
+    pub rotor: f32,
+    /// Burner flame, 0..1.
+    pub flame: f32,
+}
+
 pub struct Scene<'a> {
+    pub toy: Option<Toy>,
     pub ac: &'a Aircraft,
     /// Lights that move or change this frame (the aircraft's, the PAPI).
     pub lamps: &'a [Lamp],
@@ -350,7 +368,13 @@ pub struct Scene<'a> {
     pub wind: Vec3,
     /// Other aircraft flying around.
     pub traffic: &'a [Aircraft],
+    /// Your best run, drawn see-through.
+    pub ghost: Option<&'a Aircraft>,
     pub rings: Vec<RingDraw>,
+    /// Kids mode: balloons (position, colour).
+    pub balloons: Vec<(Vec3, [f32; 4])>,
+    /// 99 Red Balloons' rainbow road (set with `set_road`).
+    pub road: bool,
     pub papi: Vec<(Vec3, bool)>, // position, white?
     pub time: f32,
     pub shadow_alpha: f32,
@@ -502,6 +526,10 @@ pub struct Renderer {
     runway: GpuMesh,
     markings: GpuMesh,
     ring: GpuMesh,
+    balloon: GpuMesh,
+    heli: [GpuMesh; 3],
+    road: Option<GpuMesh>,
+    hot_air: [GpuMesh; 2],
     cube: GpuMesh,
     disc: GpuMesh,
     puff: GpuMesh,
@@ -607,6 +635,16 @@ impl Renderer {
             runway: upload(ctx, &mesh::runway()),
             markings: upload(ctx, &mesh::markings()),
             ring: upload(ctx, &mesh::torus(0.1)),
+            balloon: upload(ctx, &mesh::balloon()),
+            road: None,
+            heli: {
+                let (b, r, t) = crate::toys::helicopter();
+                [upload(ctx, &b), upload(ctx, &r), upload(ctx, &t)]
+            },
+            hot_air: {
+                let (b, f) = crate::toys::hot_air();
+                [upload(ctx, &b), upload(ctx, &f)]
+            },
             cube: upload(ctx, &mesh::unit_cube()),
             disc: upload(ctx, &mesh::disc(0.95)),
             puff: upload(ctx, &mesh::puff()),
@@ -722,6 +760,12 @@ impl Renderer {
             let m = Mat4::from_scale_rotation_translation(Vec3::splat(r.radius), Quat::from_rotation_arc(Vec3::Z, r.normal), r.pos);
             d.mesh(&self.ring, m, r.color, [0.0, 0.45, 0.0, 0.0]);
         }
+        for (p, c) in &scene.balloons {
+            // smaller on the rainbow road, sitting on it
+            let size = if scene.road { 4.0 } else { 6.0 };
+            let m = Mat4::from_scale_rotation_translation(Vec3::splat(size), Quat::IDENTITY, *p);
+            d.mesh(&self.balloon, m, *c, [0.0, 0.4, 0.0, 0.0]);
+        }
         for (p, white_light) in &scene.papi {
             let scale = ((*p - view.eye).length() / 1500.0).clamp(1.0, 2.5);
             let m = Mat4::from_scale_rotation_translation(vec3(2.4, 1.0, 2.4) * scale, Quat::IDENTITY, *p);
@@ -734,7 +778,13 @@ impl Renderer {
         // (the landing light shines ahead of the aircraft, not on it)
         let lamp = d.frame.lamp;
         d.frame.lamp[3] = 0.0;
-        let parts = self.plane_parts(ac, !scene.show_fuselage, false);
+        let toy_parts = scene.toy.as_ref().map(|t| self.toy_parts(t));
+        if let Some(parts) = &toy_parts {
+            for (mesh, m) in parts {
+                d.mesh(mesh, *m, white, none);
+            }
+        }
+        let parts = if toy_parts.is_some() { Vec::new() } else { self.plane_parts(ac, !scene.show_fuselage, false) };
         for (mesh, m) in &parts {
             if !std::ptr::eq(*mesh, self.burner_mesh(ac)) {
                 d.mesh(mesh, *m, white, none);
@@ -744,6 +794,15 @@ impl Renderer {
         if let Some((mesh, m)) = parts.iter().find(|(mesh, _)| std::ptr::eq(*mesh, self.burner_mesh(ac))) {
             d.ctx.apply_pipeline(&self.blend);
             d.mesh(mesh, *m, [1.0, 1.0, 1.0, ac.burner], [0.0, 1.0, 0.0, 0.0]);
+            d.ctx.apply_pipeline(&self.opaque);
+        }
+
+        // the ghost: see-through and faintly glowing (depth-written so it doesn't layer on itself)
+        if let Some(g) = scene.ghost {
+            d.ctx.apply_pipeline(&self.shadow);
+            for (mesh, m) in self.plane_parts(g, false, false) {
+                d.mesh(mesh, m, [0.6, 0.88, 1.0, 0.38], [0.0, 0.5, 0.0, 0.0]);
+            }
             d.ctx.apply_pipeline(&self.opaque);
         }
 
@@ -759,16 +818,38 @@ impl Renderer {
                 Vec4::new(kx * g, g, kz * g, 1.0),
             );
             d.ctx.apply_pipeline(&self.shadow);
-            for (mesh, m) in self.plane_parts(ac, false, true) {
+            let shadow_parts = match &toy_parts {
+                // (not the hot air balloon's flame)
+                Some(p) => p.iter().take(if scene.toy.as_ref().is_some_and(|t| t.kind == ToyKind::HotAir) { 1 } else { p.len() }).copied().collect(),
+                None => self.plane_parts(ac, false, true),
+            };
+            for (mesh, m) in shadow_parts {
                 d.mesh(mesh, proj * m, [0.0, 0.0, 0.0, shadow_alpha], [0.0, 1.0, 0.0, 2e-5]);
             }
+        }
+        // the burner's flame, glowing
+        if let Some(t) = scene.toy.as_ref().filter(|t| t.kind == ToyKind::HotAir && t.flame > 0.02) {
+            d.ctx.apply_pipeline(&self.blend);
+            let flicker = 1.0 + 0.15 * (scene.time * 31.0).sin() * (scene.time * 17.0).cos();
+            let m = t.model * Mat4::from_translation(crate::toys::BURNER) * Mat4::from_scale(vec3(1.0, (0.4 + 1.6 * t.flame) * flicker, 1.0));
+            d.mesh(&self.hot_air[1], m, [1.0, 0.8, 0.4, 0.9], [0.0, 1.0, 0.0, 0.0]);
         }
 
         // spinning prop disc
         d.ctx.apply_pipeline(&self.blend);
-        if let Some((c, r)) = self.models[ac.craft as usize].prop_disc {
+        if let Some(t) = scene.toy.as_ref().filter(|t| t.kind == ToyKind::Helicopter) {
+            // a blur where the main rotor turns
+            let m = t.model * Mat4::from_scale_rotation_translation(vec3(4.7 / 0.95, 4.7 / 0.95, 4.7 / 0.95), Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2), crate::toys::ROTOR_HUB);
+            d.mesh(&self.disc, m, [0.2, 0.2, 0.22, 0.12], [0.0, 0.0, 0.0, 0.0]);
+        } else if let Some((c, r)) = self.models[ac.craft as usize].prop_disc {
             let disc_m = Mat4::from_rotation_translation(ac.rot, ac.pos) * Mat4::from_scale_rotation_translation(Vec3::splat(r / 0.95), Quat::IDENTITY, c);
             d.mesh(&self.disc, disc_m, [0.85, 0.85, 0.85, if scene.show_fuselage { 0.10 + 0.12 * ac.ctl.throttle } else { 0.04 }], [0.0, 0.4, 0.0, 0.0]);
+        }
+
+        // the rainbow road, glowing and see-through
+        if let Some(road) = self.road.as_ref().filter(|_| scene.road) {
+            d.ctx.apply_pipeline(&self.blend);
+            d.mesh(road, Mat4::IDENTITY, [1.0, 1.0, 1.0, 0.72], [0.0, 0.6, 0.0, 0.0]);
         }
 
         // smoke and dust, farthest first so they layer properly
@@ -804,6 +885,25 @@ impl Renderer {
         }
 
         d.ctx.end_render_pass();
+    }
+
+    /// Upload 99 Red Balloons' road (once: it's the same every time).
+    pub fn set_road(&mut self, ctx: &mut dyn RenderingBackend, path: &[Vec3]) {
+        if self.road.is_none() {
+            self.road = Some(upload(ctx, &mesh::rainbow_road(path)));
+        }
+    }
+
+    /// The toy's solid parts posed for this frame (the body first).
+    fn toy_parts(&self, t: &Toy) -> Vec<(&GpuMesh, Mat4)> {
+        match t.kind {
+            ToyKind::Helicopter => {
+                let main = t.model * Mat4::from_translation(crate::toys::ROTOR_HUB) * Mat4::from_rotation_y(t.rotor);
+                let tail = t.model * Mat4::from_translation(crate::toys::TAIL_HUB) * Mat4::from_rotation_x(t.rotor * 1.7);
+                vec![(&self.heli[0], t.model), (&self.heli[1], main), (&self.heli[2], tail)]
+            }
+            ToyKind::HotAir => vec![(&self.hot_air[0], t.model)],
+        }
     }
 
     /// The afterburner flame's mesh, if this aircraft has one.

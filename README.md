@@ -40,6 +40,35 @@ cargo run --release
 - **Free flight**: pick the aircraft, the start (either runway end, 4 or 10 nm final, the
   grass strip, over the harbour, airborne), the time of day, wind, gusts, turbulence,
   clouds, cloud base, visibility and thermals. Your setup is remembered.
+- **Stars and unlocks**: every objective earns up to three stars (a landing: one for getting
+  down and stopped, two for a B, three for an A; a ring race: beat the target times). Stars
+  unlock the sailplane (4), the 737 (8) and the F-16 (18). `skyhop --unlock-all` opens
+  everything for good.
+- **Ghosts**: retry a challenge and your best run flies beside you, see-through (J hides it).
+  Ring races show your split against it at every ring, and landings compare you with your
+  best touchdown.
+- **Approach debrief**: after a graded landing, a chart of your glide path and speed over
+  the last few miles against the ideal, and the one or two things to work on next time.
+- **Kids mode**, for little pilots: the stick works like a real plane's (pull back to climb)
+  but nothing can go wrong. No stalling, no crashing, and the runway brings the plane in to
+  land when you line up. A friendly voice gives little missions, each with a picture: pop ten
+  balloons (counted out loud), fly through five rainbow rings, find the windmills, the
+  lighthouse or the boat (a trail of balloons shows the way), and land. Every mission earns
+  a star. Balloons are everywhere; one just ahead pulls you onto it. Fly a trainer, a big
+  jet, a fast jet, a glider, a helicopter or a hot air balloon (the last two set down
+  anywhere: push down near the ground). Zoom and rainbow smoke.
+- **99 Red Balloons**: a speedrun on a glowing rainbow road that loops round the airport in
+  the sunset, with 99 red balloons sitting on it in a line. You wait at the start gate and
+  the clock starts when you move the stick; every balloon flown past costs two seconds. A
+  steady lap in the trainer takes under two minutes; zooming on the straights and easing off
+  for the turns is quicker (the faster planes are quicker still, if you can hold the line).
+  R or B starts again at any time; Y or P picks the plane at the gate. A track map shows the
+  road and the balloons still ahead, and your best lap is saved with the plane you flew. The
+  music is an original tune in the style of early-80s German new wave (a slow, airy intro,
+  then a fast band: pumping octave bass, offbeat stabs, a brassy lead, drum machine),
+  synthesized live. To play your own music instead, put a MIDI file named
+  `red_balloons.mid` in the save folder (channel 10 plays as drums; bass and pad
+  instruments get their own voices).
 - **Instant replay** from any dialog (crashed, landed or paused), through any camera at any
   speed.
 
@@ -92,6 +121,7 @@ disconnect wailer, Doppler in the tower view, and chimes with a little room reve
 | U | head-up display in the cockpit view |
 | Tab / O | instruments full / compact / off, lesson coach less / more |
 | Space | in a dialog or paused: instant replay |
+| J | ghost of your best run on / off |
 | Y / I / M | auto-rudder, invert pitch, mute |
 | R, N, Esc, H | restart, skip lesson step, pause, help |
 
@@ -107,6 +137,17 @@ disconnect wailer, Doppler in the tower view, and chimes with a little room reve
 | 9 / 0 | vertical speed |
 | 7 / 8 | speed |
 | Mouse | click a window on the panel to press it, scroll over it to set it |
+
+### Kids mode
+
+| Keys / gamepad | Action |
+| --- | --- |
+| Arrows or WASD / left stick | fly: pull back (down) to climb, push to dive, left and right turn |
+| Space or Shift / A or RT | zoom |
+| X / X | rainbow smoke on / off |
+| P or Tab / Y | next plane (trainer, helicopter, hot air balloon, 737, F-16, sailplane) |
+| I / - | push to climb instead |
+| Esc / Start | back to the menu |
 
 ### Gamepad
 
@@ -136,31 +177,38 @@ something, and menus and dialogs switch to gamepad hints.
 cargo test --release          # flight models, autopilot/autoland, scoring, scripted lessons
 cargo test --release audio_demo -- --ignored      # target/audio_demo.wav (scripted flight)
 cargo test --release jet_audio_demo -- --ignored  # target/jet_demo.wav: 737 final, touchdown, reverse
+cargo test --release theme_demo -- --ignored      # target/theme.wav: a minute of 99 Red Balloons' music
 cargo run --release -- --shot out.png 7 cockpit   # render a lesson and save a screenshot
 ```
 
 `--shot <file> <lesson index | menu | setup> [chase|cockpit|orbit|tower]` takes extra
 `key=value` arguments: `hour=21.5 clouds=0.9 base=400 wind=20 from=30 vis=3` for the
-weather, `final=2000` to sit on the glide path, `craft=2 place=4` for a free flight, `ap`
+weather, `final=2000` to sit on the glide path, `craft=2 place=4` for a free flight, `ap=1`
 to engage the autopilot, `ab=1` for afterburner, `eye=x,y,z:tx,ty,tz` for a fixed camera,
-`replay` and `help`.
+`speed=4` to run the simulation faster, `frames=N` to capture a later frame, `sel=N` to
+select a menu row, `replay` and `help`. The scenes `menu`, `objectives` and `setup` show
+the menus; `red` starts 99 Red Balloons, `kids` starts kids mode (`kids=N` flies N metres short of the first balloon,
+`kidsland=N` N metres out on final, `vehicle=N` and `quest=N` pick what to fly and the
+mission). Set `SKYHOP_DATA=<dir>` to keep test runs out of your real profile.
 
 Source layout: `flight.rs` (physics and the aircraft specs), `ap.rs` (autopilot), `weather.rs`
 (wind, turbulence, thermals, sky colours), `world.rs` (island and placement), `ground.rs`
 (baked ground textures), `mesh.rs` (geometry and the trainer), `airliner.rs`, `fighter.rs`,
 `glider.rs` (the other models), `scenery.rs` (airport extras, turbines, lighthouse, boats),
-`traffic.rs` (other aircraft), `atc.rs` (tower clearances),
+`traffic.rs` (other aircraft), `atc.rs` (tower clearances), `kids.rs` (kids mode and 99 Red Balloons), `music.rs` (its music and MIDI player), `toys.rs` (its helicopter and balloon), `progress.rs` (stars and
+unlocks), `ghost.rs` (best-run ghosts), `debrief.rs` (approach debrief),
 `lights.rs` (airport and aircraft lights), `render.rs` (shaders, GPU buffers), `hud.rs`
 (instruments, HUD, menus), `lessons.rs`, `score.rs` (landing scorecard), `replay.rs`,
 `setup.rs` (free-flight setup and the saved profile), `gpws.rs` (callouts), `audio.rs`
 (real-time synth), `camera.rs`, `input.rs` (gamepad), `main.rs`.
 
 Progress and settings are saved to `~/Library/Application Support/Skyhop/profile.txt`
-(macOS), `%APPDATA%\Skyhop` (Windows) or `~/.config/skyhop` (Linux).
+(macOS), `%APPDATA%\Skyhop` (Windows) or `~/.config/skyhop` (Linux), with ghosts in a
+`ghosts` folder beside it.
 
 ### Callouts
 
-The 737's spoken callouts in `assets/callouts` and the tower's words in `assets/atc` were
-made with macOS `say` (the "Fred" and "Samantha" voices) by `tools/callouts.sh`. Apple licenses its system voices for personal, non-commercial
+The 737's spoken callouts in `assets/callouts`, the tower's words in `assets/atc` and kids
+mode's voice in `assets/kids` were made with macOS `say` (the "Fred" and "Samantha" voices) by `tools/callouts.sh`. Apple licenses its system voices for personal, non-commercial
 projects; before distributing Skyhop, regenerate them with another text-to-speech engine
 (same file names, 16-bit mono WAV).

@@ -38,3 +38,28 @@ atc land "cleared to land"
 atc takeoff "cleared for takeoff"
 atc goaround "go around"
 atc welcome "welcome to Skyhop island, taxi to parking"
+
+# Kids mode: a friendly voice counting the balloons, giving the missions and cheering.
+mkdir -p ../kids && cd ../kids
+kid() { say -v Samantha -r 175 -o "$1.wav" --file-format=WAVE --data-format=LEI16@22050 "$2"; }
+for n in 1:One 2:Two 3:Three 4:Four 5:Five 6:Six 7:Seven 8:Eight 9:Nine 10:Ten; do kid "n${n%%:*}" "${n#*:}!"; done
+kid go "Let's go flying!"
+kid balloons "Let's pop the balloons!"
+kid rainbows "Fly through the rainbows!"
+kid lighthouse "Can you find the lighthouse? Follow the balloons!"
+kid boat "Can you find the boat? Follow the balloons!"
+kid windmills "Can you find the windmills? Follow the balloons!"
+kid land "Time to land! Fly to the runway."
+kid found "You found it!"
+kid yay "Yay!"
+kid hooray "Hooray!"
+kid great "Great job!"
+kid did_it "You did it!"
+kid landed "You landed! Great job!"
+kid up "Up, up, and away!"
+kid plane "Little plane!"
+kid heli "Helicopter!"
+kid hot_air "Hot air balloon!"
+kid jet "Big jet!"
+kid fighter "Fast jet!"
+kid glider "Glider!"

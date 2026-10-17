@@ -1028,32 +1028,179 @@ pub fn toasts(list: &[(String, f32)]) {
 
 /// Centered card with a title and lines of text.
 pub fn dialog(title: &str, title_c: Color, body: &[String], footer: &str) {
+    dialog_ex(title, title_c, body, footer, &Extras::default());
+}
+
+/// What a results dialog can show besides text.
+#[derive(Default)]
+pub struct Extras<'a> {
+    /// Stars earned this time, out of how many.
+    pub stars: Option<(u32, u32)>,
+    pub chart: Option<&'a crate::debrief::Debrief>,
+}
+
+pub fn dialog_ex(title: &str, title_c: Color, body: &[String], footer: &str, ex: &Extras) {
     let (sw, sh) = (screen_width(), screen_height());
     let u = ui();
     draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.0, 0.4));
-    let fs = (sh / 40.0).clamp(15.0, 19.0 * u);
-    let w = (sw * 0.5).clamp(360.0, 640.0 * u);
-    let inner = w - fs * 3.0;
-    let mut lines = Vec::new();
-    for b in body {
-        if b.is_empty() {
-            lines.push(String::new());
+    let charted = ex.chart.is_some();
+    // the chart sits beside the text, or under it on a narrow screen
+    let stacked = charted && sw < 760.0 * u;
+    let w = if charted && !stacked { (sw * 0.86).clamp(560.0, 1120.0 * u).min(sw - 20.0) } else { (sw * 0.5).clamp(360.0, 640.0 * u).min(sw - 20.0) };
+    let col = if charted && !stacked { w * 0.5 } else { w };
+    // shrink the text until it all fits on the screen
+    let mut fs = (sh / 42.0).clamp(14.0, 19.0 * u);
+    let layout = |fs: f32| {
+        let mut lines = Vec::new();
+        for b in body {
+            if b.is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(wrap(b, col - fs * 3.0, fs));
         }
-        lines.extend(wrap(b, inner, fs));
+        let stars_h = if ex.stars.is_some() { fs * 2.8 } else { 0.0 };
+        let text_h = lines.len() as f32 * fs * 1.45;
+        let chart_h = match (charted, stacked) {
+            (false, _) => 0.0,
+            (true, false) => (fs * 19.0).max(text_h),
+            (true, true) => fs * 20.0,
+        };
+        let content = if stacked { text_h + fs * 1.5 + chart_h } else { text_h.max(chart_h) };
+        (lines, stars_h, text_h, chart_h, fs * 5.0 + stars_h + content + fs * 2.2)
+    };
+    let (mut lines, mut stars_h, mut text_h, mut chart_h, mut h) = layout(fs);
+    while h > sh - 16.0 && fs > 9.0 {
+        fs *= 0.92;
+        (lines, stars_h, text_h, chart_h, h) = layout(fs);
     }
-    let h = fs * 5.0 + lines.len() as f32 * fs * 1.45 + fs * 2.2;
-    let (x, y) = ((sw - w) / 2.0, (sh - h) / 2.0);
+    let (x, y) = ((sw - w) / 2.0, ((sh - h) / 2.0).max(8.0));
     let r = 14.0 * u;
     rrect(x, y, w, h, r, Color::new(0.04, 0.055, 0.08, 0.94));
     rrect_lines(x, y, w, h, r, 1.0, EDGE);
     rrect(x + w * 0.5 - fs * 2.0, y + fs * 0.9, fs * 4.0, fs * 0.22, fs * 0.11, title_c);
     text_cb(title, sw / 2.0, y + fs * 2.6, fs * 1.6, title_c);
     let mut yy = y + fs * 4.8;
+    if let Some((n, max)) = ex.stars {
+        let sr = fs * 1.05;
+        let row_w = sr * 2.3 * (max as f32 - 1.0) + sr * 2.0;
+        star_row(sw / 2.0 + row_w / 2.0, yy + fs * 0.3, sr, n, max);
+        yy += stars_h;
+    }
+    let body_top = yy;
     for l in &lines {
-        text_c(l, sw / 2.0, yy, fs, INK);
+        if charted {
+            text(l, x + fs * 1.5, yy, fs, INK);
+        } else {
+            text_c(l, sw / 2.0, yy, fs, INK);
+        }
         yy += fs * 1.45;
     }
-    text_c(footer, sw / 2.0, y + h - fs * 1.4, fs * 0.82, DIM);
+    if let Some(d) = ex.chart {
+        if stacked {
+            approach_chart(x + fs * 1.5, body_top + text_h + fs * 0.6, w - fs * 3.0, chart_h, d, fs);
+        } else {
+            let cx = x + col + fs * 0.5;
+            approach_chart(cx, body_top - fs * 0.9, x + w - fs * 1.5 - cx, chart_h, d, fs);
+        }
+    }
+    let ff = fs * 0.82 * ((w - fs * 2.0) / text_w(footer, fs * 0.82)).min(1.0);
+    text_c(footer, sw / 2.0, y + h - fs * 1.4, ff, DIM);
+}
+
+/// The debrief: glide path and speed over the last few miles, and what to work on.
+fn approach_chart(x: f32, y: f32, w: f32, h: f32, d: &crate::debrief::Debrief, fs: f32) {
+    use crate::debrief::ideal_height;
+    use crate::flight::FT;
+    let u = ui();
+    let tips: Vec<String> = d.tips.iter().flat_map(|t| wrap(t, w - fs * 1.2, fs * 0.9)).collect();
+    let tips_h = fs * 1.6 + tips.len() as f32 * fs * 1.25;
+    let panel = Color::new(1.0, 1.0, 1.0, 0.035);
+    let (dmax, dmin) = (d.span, -300.0);
+    let px = |dist: f32| x + (dmax - dist) / (dmax - dmin) * w;
+    let colour = |err: f32, tol: f32| {
+        if err <= tol {
+            GREEN_C
+        } else if err <= tol * 2.0 {
+            AMBER
+        } else {
+            RED_C
+        }
+    };
+
+    // glide path
+    let gh = (h - tips_h) * 0.6 - fs * 1.6;
+    let gy = y + fs * 1.4;
+    rrect(x, gy, w, gh, fs * 0.4, panel);
+    text_b("GLIDE PATH", x + fs * 0.6, gy - fs * 0.4, fs * 0.72, DIM);
+    let flown_max = d.pts.iter().map(|p| p.1).fold(0.0, f32::max);
+    let hmax = (ideal_height(dmax) * 1.7).max(flown_max * 1.1).min(ideal_height(dmax) * 3.0);
+    let py = |hgt: f32| gy + gh - fs * 0.6 - hgt.clamp(-hmax * 0.05, hmax) / hmax * (gh - fs * 1.2);
+    // height ticks
+    let step = if hmax / FT > 1200.0 { 500.0 } else { 200.0 };
+    let mut ft = step;
+    while ft * FT < hmax {
+        let ty = py(ft * FT);
+        draw_line(x, ty, x + w, ty, 1.0, Color::new(1.0, 1.0, 1.0, 0.05));
+        text(&format!("{ft:.0} ft"), x + fs * 0.4, ty - fs * 0.2, fs * 0.65, Color::new(DIM.r, DIM.g, DIM.b, 0.7));
+        ft += step;
+    }
+    // the runway, from the threshold (400 m before the aiming point) on
+    let ground = py(0.0);
+    draw_rectangle(px(crate::world::PAPI_DIST), ground - 1.5 * u, px(dmin) - px(crate::world::PAPI_DIST), 4.0 * u, Color::new(0.55, 0.55, 0.58, 1.0));
+    // the band that counts as on the path, and the 3 degree line itself
+    let n = 24;
+    for k in 0..n {
+        let (a, b) = (dmax * k as f32 / n as f32, dmax * (k + 1) as f32 / n as f32);
+        let (lo_a, hi_a, lo_b, hi_b) = (ideal_height(a) - d.path_tol, ideal_height(a) + d.path_tol, ideal_height(b) - d.path_tol, ideal_height(b) + d.path_tol);
+        let band = Color::new(GREEN_C.r, GREEN_C.g, GREEN_C.b, 0.1);
+        draw_triangle(vec2(px(a), py(lo_a.max(0.0))), vec2(px(a), py(hi_a)), vec2(px(b), py(hi_b)), band);
+        draw_triangle(vec2(px(a), py(lo_a.max(0.0))), vec2(px(b), py(hi_b)), vec2(px(b), py(lo_b.max(0.0))), band);
+    }
+    draw_line(px(dmax), py(ideal_height(dmax)), px(0.0), py(0.0), 1.5 * u, Color::new(AMBER.r, AMBER.g, AMBER.b, 0.8));
+    for p in d.pts.windows(2) {
+        let (a, b) = (p[0], p[1]);
+        if a.0 > dmax {
+            continue;
+        }
+        let err = (b.1 - ideal_height(b.0)).abs();
+        draw_line(px(a.0), py(a.1), px(b.0), py(b.1), 2.5 * u, colour(err, d.path_tol));
+    }
+    // distance ticks
+    let nm = 1852.0;
+    let mut m = nm;
+    while m < dmax {
+        let tx = px(m);
+        draw_line(tx, ground, tx, ground + fs * 0.3, 1.0, DIM);
+        text_c(&format!("{:.0} nm", m / nm), tx, ground + fs * 1.05, fs * 0.65, DIM);
+        m += nm;
+    }
+
+    // speed
+    let sy = gy + gh + fs * 1.9;
+    let shh = (h - tips_h) * 0.4 - fs * 1.9;
+    rrect(x, sy, w, shh, fs * 0.4, panel);
+    text_b("SPEED", x + fs * 0.6, sy - fs * 0.4, fs * 0.72, DIM);
+    let span_kt = 25.0;
+    let vy = |kt: f32| sy + shh / 2.0 - (kt - d.target_kt).clamp(-span_kt, span_kt) / span_kt * (shh / 2.0 - fs * 0.4);
+    let (lo, hi) = (d.target_kt - 5.0, d.target_kt + d.speed_tol);
+    draw_rectangle(x, vy(hi), w, vy(lo) - vy(hi), Color::new(GREEN_C.r, GREEN_C.g, GREEN_C.b, 0.1));
+    draw_line(x, vy(d.target_kt), x + w, vy(d.target_kt), 1.5 * u, Color::new(AMBER.r, AMBER.g, AMBER.b, 0.8));
+    text(&format!("target {:.0} kt", d.target_kt), x + w - text_w(&format!("target {:.0} kt", d.target_kt), fs * 0.65) - fs * 0.4, vy(d.target_kt) - fs * 0.3, fs * 0.65, Color::new(AMBER.r, AMBER.g, AMBER.b, 0.9));
+    for p in d.pts.windows(2) {
+        let (a, b) = (p[0], p[1]);
+        if a.0 > dmax || b.0 < -100.0 {
+            continue;
+        }
+        let err = if b.2 < lo { (lo - b.2) + 5.0 } else if b.2 > hi { (b.2 - hi) + 5.0 } else { 0.0 };
+        draw_line(px(a.0), vy(a.2), px(b.0), vy(b.2), 2.5 * u, colour(err, 5.0));
+    }
+
+    // what to work on
+    let ty = sy + shh + fs * 1.5;
+    text_b("TO WORK ON", x + fs * 0.6, ty, fs * 0.72, DIM);
+    for (k, l) in tips.iter().enumerate() {
+        text(l, x + fs * 0.6, ty + fs * 1.35 + k as f32 * fs * 1.25, fs * 0.9, INK);
+    }
 }
 
 /// (keys, what they do). An empty key starts a new section titled by the description; a
@@ -1076,6 +1223,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("U", "head-up display in the cockpit"),
     ("Tab   O", "instruments full / compact / off, coach less / more"),
     ("Space", "in a dialog or paused: instant replay"),
+    ("J", "ghost of your best run on / off"),
     ("", "AUTOPILOT"),
     ("Z   K", "autopilot on / off, autothrottle (jets)"),
     ("1  2  3  4", "heading, altitude hold, vertical speed, approach"),
@@ -1154,8 +1302,53 @@ pub fn help_overlay() {
 /// A row of the main menu.
 pub enum MenuRow {
     Header(&'static str),
-    /// Name, a note on the right (best time, done), and the blurb shown when selected.
-    Item(String, String, String),
+    Item(MenuItem),
+}
+
+#[derive(Default)]
+pub struct MenuItem {
+    pub name: String,
+    /// A note on the right (best time, grade).
+    pub mark: String,
+    /// Shown under the list when selected.
+    pub blurb: String,
+    /// How to earn the stars, shown under the blurb.
+    pub goal: String,
+    /// (earned, possible): up to three are drawn as stars, more as a count.
+    pub stars: Option<(u32, u32)>,
+    /// Stars still needed to unlock it.
+    pub locked: Option<u32>,
+}
+
+/// A five-pointed star, filled or as an outline.
+pub fn star(cx: f32, cy: f32, r: f32, filled: bool, c: Color) {
+    let p = |k: usize| {
+        let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+        let rr = if k % 2 == 0 { r } else { r * 0.45 };
+        vec2(cx + a.cos() * rr, cy + a.sin() * rr)
+    };
+    for k in 0..10 {
+        if filled {
+            draw_triangle(vec2(cx, cy), p(k), p(k + 1), c);
+        } else {
+            let (a, b) = (p(k), p(k + 1));
+            draw_line(a.x, a.y, b.x, b.y, (r * 0.14).max(1.0), c);
+        }
+    }
+}
+
+/// `n` of `max` stars in a row ending at `right`; returns the row's width.
+pub fn star_row(right: f32, cy: f32, r: f32, n: u32, max: u32) -> f32 {
+    let step = r * 2.3;
+    for k in 0..max {
+        let cx = right - r - (max - 1 - k) as f32 * step;
+        if k < n {
+            star(cx, cy, r, true, AMBER);
+        } else {
+            star(cx, cy, r, false, Color::new(DIM.r, DIM.g, DIM.b, 0.6));
+        }
+    }
+    step * (max as f32 - 1.0) + r * 2.0
 }
 
 fn menu_frame(time: f32) -> (f32, f32, f32, f32, f32) {
@@ -1176,17 +1369,19 @@ fn menu_frame(time: f32) -> (f32, f32, f32, f32, f32) {
     (x, ty + title * 0.85, w, fs, u)
 }
 
-pub fn menu(rows: &[MenuRow], sel: usize, time: f32, pad: bool) {
+/// `sub`: a submenu, where Esc / B goes back rather than quits.
+pub fn menu(rows: &[MenuRow], sel: usize, time: f32, pad: bool, sub: bool) {
     let sh = screen_height();
     let (x, y, w, fs, u) = menu_frame(time);
     let row = fs * 1.85;
     let head = fs * 1.6;
+    let foot = fs * 6.4;
     let height = |r: &MenuRow| if matches!(r, MenuRow::Header(_)) { head } else { row };
     let list_h: f32 = rows.iter().map(height).sum();
-    let h = (list_h + fs * 5.0).min(sh - y - fs);
+    let h = (list_h + foot + fs * 0.6).min(sh - y - fs);
     card(x, y, w, h);
     // scroll so the selected row stays in view when the list is taller than the card
-    let view = h - fs * 5.0;
+    let view = h - foot - fs * 0.6;
     let sel_y: f32 = rows.iter().take(sel).map(height).sum();
     let scroll = if list_h > view { (sel_y - view * 0.5 + row).clamp(0.0, list_h - view) } else { 0.0 };
     let mut yy = y + fs * 0.6 - scroll;
@@ -1200,32 +1395,69 @@ pub fn menu(rows: &[MenuRow], sel: usize, time: f32, pad: bool) {
                 text_b(t, x + fs * 1.4, yy + head * 0.75, fs * 0.72, DIM);
                 yy += head;
             }
-            MenuRow::Item(name, mark, _) => {
+            MenuRow::Item(it) => {
                 let selected = i == sel;
                 if selected {
                     rrect(x + fs * 0.5, yy, w - fs, row * 0.9, fs * 0.45, Color::new(1.0, 0.77, 0.26, 0.18));
                     rrect(x + fs * 0.5, yy + row * 0.2, 3.0 * u, row * 0.5, 1.5 * u, AMBER);
                 }
-                let c = if selected { AMBER } else { INK };
-                draw_str(name, x + fs * 1.4, yy + row * 0.45 + fs * 0.36, fs, c, selected);
-                if !mark.is_empty() {
-                    let mw = text_w(mark, fs * 0.85);
-                    text(mark, x + w - mw - fs * 1.3, yy + row * 0.45 + fs * 0.3, fs * 0.85, GREEN_C);
+                let c = match (it.locked, selected) {
+                    (Some(_), _) => Color::new(DIM.r, DIM.g, DIM.b, 0.7),
+                    (None, true) => AMBER,
+                    (None, false) => INK,
+                };
+                let cy = yy + row * 0.45;
+                let sr = fs * 0.42;
+                // right side: stars (or what it takes to unlock), then the mark
+                let mut right = x + w - fs * 1.2;
+                if let Some(need) = it.locked {
+                    star(right - sr, cy, sr, true, Color::new(DIM.r, DIM.g, DIM.b, 0.8));
+                    let t = format!("{need} to unlock");
+                    let tw = text_w(&t, fs * 0.8);
+                    text(&t, right - sr * 2.6 - tw, cy + fs * 0.28, fs * 0.8, DIM);
+                    right -= sr * 2.6 + tw + fs * 0.6;
+                } else if let Some((n, max)) = it.stars {
+                    if max <= 3 {
+                        right -= star_row(right, cy, sr, n, max) + fs * 0.6;
+                    } else {
+                        star(right - sr, cy, sr, true, AMBER);
+                        let t = format!("{n} / {max}");
+                        let tw = text_w(&t, fs * 0.85);
+                        text(&t, right - sr * 2.6 - tw, cy + fs * 0.3, fs * 0.85, AMBER);
+                        right -= sr * 2.6 + tw + fs * 0.6;
+                    }
                 }
+                if !it.mark.is_empty() {
+                    let mw = text_w(&it.mark, fs * 0.8);
+                    text(&it.mark, right - mw, cy + fs * 0.28, fs * 0.8, GREEN_C);
+                    right -= mw + fs * 0.6;
+                }
+                // shrink a long name to fit
+                let room = right - x - fs * 1.4;
+                let nf = fs * (room / measure(&it.name, fs, true).width).min(1.0);
+                draw_str(&it.name, x + fs * 1.4, cy + nf * 0.36, nf, c, selected);
                 yy += row;
             }
         }
     }
-    let blurb = match rows.get(sel) {
-        Some(MenuRow::Item(_, _, b)) => b.as_str(),
-        _ => "",
-    };
-    let by = y + h - fs * 3.2;
-    draw_line(x + fs, by - fs * 1.1, x + w - fs, by - fs * 1.1, 1.0, EDGE);
-    for (k, l) in wrap(blurb, w - fs * 2.5, fs * 0.9).iter().take(2).enumerate() {
-        text(l, x + fs * 1.4, by + k as f32 * fs * 1.2, fs * 0.9, DIM);
+    let by = y + h - foot + fs * 0.4;
+    draw_line(x + fs, by, x + w - fs, by, 1.0, EDGE);
+    if let Some(MenuRow::Item(it)) = rows.get(sel) {
+        // three lines: the goal (up to two) wins over the end of the blurb
+        let goal: Vec<String> = wrap(&it.goal, w - fs * 2.5, fs * 0.9).into_iter().take(2).collect();
+        let mut lines: Vec<(String, Color)> = wrap(&it.blurb, w - fs * 2.5, fs * 0.9).into_iter().map(|l| (l, DIM)).collect();
+        lines.truncate(3 - goal.len());
+        lines.extend(goal.into_iter().map(|l| (l, Color::new(AMBER.r, AMBER.g, AMBER.b, 0.85))));
+        for (k, (l, c)) in lines.iter().enumerate() {
+            text(l, x + fs * 1.4, by + fs * 1.4 + k as f32 * fs * 1.2, fs * 0.9, *c);
+        }
     }
-    let hint = if pad { "D-pad  choose      A  fly      Select  controls" } else { "Up / Down  choose      Enter  fly      H  controls      Esc  quit" };
+    let hint = match (pad, sub) {
+        (true, false) => "D-pad  choose      A  select      Select  controls",
+        (true, true) => "D-pad  choose      A  fly      B  back      Select  controls",
+        (false, false) => "Up / Down  choose      Enter  select      H  controls      Esc  quit",
+        (false, true) => "Up / Down  choose      Enter  fly      H  controls      Esc  back",
+    };
     let hs = (fs * 0.78).min(fs * 0.78 * (w - fs * 2.8) / text_w(hint, fs * 0.78));
     text(hint, x + fs * 1.4, y + h - fs * 0.9, hs, Color::new(DIM.r, DIM.g, DIM.b, 0.8));
 }
@@ -1504,4 +1736,386 @@ pub fn head_up(h: &HeadUp) {
         dm(vec2(gx, ty - gs * step));
         dm(vec2(sw / 2.0 + loc * step, ly));
     }
+}
+
+// ---------------------------------------------------------------- kids mode ---
+
+/// 99 Red Balloons' card.
+pub struct RedHud {
+    pub popped: usize,
+    pub missed: usize,
+    /// The clock, with the penalties, and the best lap.
+    pub time: f32,
+    pub best: Option<f32>,
+}
+
+pub struct KidsHud<'a> {
+    pub view_proj: Mat4,
+    pub eye: Vec3,
+    pub time: f32,
+    pub quest: crate::kids::Quest,
+    /// Done towards the mission, and the colours of the balloons popped for it.
+    pub progress: usize,
+    pub colors: &'a [[f32; 4]],
+    /// The mission is done (seconds since): celebrate.
+    pub done: Option<f32>,
+    /// Missions done, ever.
+    pub stars: u32,
+    pub red: Option<RedHud>,
+    /// 99 Red Balloons' track map: the road, where you are and which way you're heading, and
+    /// the balloons still ahead.
+    pub track: Option<(&'a [Vec3], Vec3, f32, Vec<Vec3>)>,
+    /// Where the big arrow points, and its colour.
+    pub target: Option<(Vec3, Color)>,
+    pub banner: Option<(&'a str, f32)>,
+    pub hint: Option<&'a str>,
+    pub plane: &'a str,
+    pub pad: bool,
+}
+
+fn balloon_icon(cx: f32, cy: f32, r: f32, c: Color) {
+    draw_line(cx, cy + r * 1.1, cx + r * 0.25, cy + r * 2.3, (r * 0.08).max(1.0), Color::new(1.0, 1.0, 1.0, 0.8));
+    draw_triangle(vec2(cx, cy + r * 0.95), vec2(cx - r * 0.2, cy + r * 1.25), vec2(cx + r * 0.2, cy + r * 1.25), c);
+    draw_ellipse(cx, cy, r * 0.88, r * 1.05, 0.0, c);
+    draw_ellipse(cx - r * 0.32, cy - r * 0.4, r * 0.18, r * 0.28, -20.0, Color::new(1.0, 1.0, 1.0, 0.55));
+}
+
+const RAINBOW_C: [Color; 6] = [
+    Color::new(1.0, 0.25, 0.3, 1.0),
+    Color::new(1.0, 0.62, 0.12, 1.0),
+    Color::new(1.0, 0.9, 0.2, 1.0),
+    Color::new(0.3, 0.85, 0.35, 1.0),
+    Color::new(0.25, 0.6, 1.0, 1.0),
+    Color::new(0.75, 0.4, 1.0, 1.0),
+];
+
+/// An arc of a circle (screen angles, degrees, 0 = right, 90 = down) as a thick band.
+fn arc(cx: f32, cy: f32, r: f32, w: f32, a0: f32, a1: f32, c: Color) {
+    let n = 18;
+    for k in 0..n {
+        let (t0, t1) = ((a0 + (a1 - a0) * k as f32 / n as f32).to_radians(), (a0 + (a1 - a0) * (k + 1) as f32 / n as f32).to_radians());
+        let (i0, o0) = (vec2(cx + t0.cos() * (r - w / 2.0), cy + t0.sin() * (r - w / 2.0)), vec2(cx + t0.cos() * (r + w / 2.0), cy + t0.sin() * (r + w / 2.0)));
+        let (i1, o1) = (vec2(cx + t1.cos() * (r - w / 2.0), cy + t1.sin() * (r - w / 2.0)), vec2(cx + t1.cos() * (r + w / 2.0), cy + t1.sin() * (r + w / 2.0)));
+        draw_triangle(i0, o0, o1, c);
+        draw_triangle(i0, o1, i1, c);
+    }
+}
+
+/// A rainbow, or (not flown through yet) just its outline.
+fn rainbow_icon(cx: f32, cy: f32, s: f32, faded: bool) {
+    let w = s * 0.14;
+    if faded {
+        let c = Color::new(1.0, 1.0, 1.0, 0.4);
+        arc(cx, cy + s * 0.35, s * 0.95, s * 0.05, 180.0, 360.0, c);
+        arc(cx, cy + s * 0.35, s * 0.95 - 5.0 * w, s * 0.05, 180.0, 360.0, c);
+        return;
+    }
+    for (i, c) in RAINBOW_C.iter().enumerate() {
+        arc(cx, cy + s * 0.35, s * 0.95 - i as f32 * w, w * 1.02, 180.0, 360.0, *c);
+    }
+}
+
+fn lighthouse_icon(cx: f32, cy: f32, s: f32, time: f32) {
+    let (top, bot) = (cy - s * 0.55, cy + s * 0.95);
+    let band = |y0: f32, y1: f32, c: Color| {
+        let half = |y: f32| s * (0.16 + 0.12 * (y - top) / (bot - top));
+        let (h0, h1) = (half(y0), half(y1));
+        draw_triangle(vec2(cx - h0, y0), vec2(cx + h0, y0), vec2(cx + h1, y1), c);
+        draw_triangle(vec2(cx - h0, y0), vec2(cx + h1, y1), vec2(cx - h1, y1), c);
+    };
+    for k in 0..5 {
+        let (y0, y1) = (top + (bot - top) * k as f32 / 5.0, top + (bot - top) * (k + 1) as f32 / 5.0);
+        band(y0, y1, if k % 2 == 0 { Color::new(0.92, 0.2, 0.2, 1.0) } else { WHITE });
+    }
+    // the lamp, its beams sweeping, and a red cap
+    let a = time * 2.0;
+    for k in 0..2 {
+        let d = vec2((a + k as f32 * std::f32::consts::PI).cos(), 0.0);
+        let p = vec2(cx, top - s * 0.18);
+        draw_triangle(p, p + vec2(d.x * s * 0.9, -s * 0.12), p + vec2(d.x * s * 0.9, s * 0.12), Color::new(1.0, 0.95, 0.5, 0.35 * d.x.abs()));
+    }
+    draw_rectangle(cx - s * 0.17, top - s * 0.3, s * 0.34, s * 0.3, Color::new(1.0, 0.9, 0.35, 1.0));
+    draw_triangle(vec2(cx - s * 0.24, top - s * 0.3), vec2(cx + s * 0.24, top - s * 0.3), vec2(cx, top - s * 0.55), Color::new(0.85, 0.15, 0.15, 1.0));
+}
+
+fn windmill_icon(cx: f32, cy: f32, s: f32, time: f32) {
+    let hub = vec2(cx, cy - s * 0.35);
+    let white = Color::new(0.97, 0.97, 0.97, 1.0);
+    draw_triangle(vec2(cx - s * 0.05, hub.y), vec2(cx + s * 0.05, hub.y), vec2(cx + s * 0.09, cy + s * 0.95), white);
+    draw_triangle(vec2(cx - s * 0.05, hub.y), vec2(cx + s * 0.09, cy + s * 0.95), vec2(cx - s * 0.09, cy + s * 0.95), white);
+    for k in 0..3 {
+        let a = time * 1.5 + k as f32 * std::f32::consts::TAU / 3.0;
+        let d = vec2(a.cos(), a.sin());
+        let n = vec2(-d.y, d.x);
+        draw_triangle(hub + n * s * 0.07, hub - n * s * 0.04, hub + d * s * 0.75, white);
+    }
+    draw_circle(hub.x, hub.y, s * 0.08, Color::new(0.8, 0.8, 0.82, 1.0));
+}
+
+fn boat_icon(cx: f32, cy: f32, s: f32, time: f32) {
+    let bob = (time * 2.0).sin() * s * 0.04;
+    let y = cy + s * 0.35 + bob;
+    let hull = Color::new(0.85, 0.2, 0.2, 1.0);
+    draw_triangle(vec2(cx - s * 0.85, y - s * 0.15), vec2(cx + s * 0.85, y - s * 0.15), vec2(cx + s * 0.6, y + s * 0.25), hull);
+    draw_triangle(vec2(cx - s * 0.85, y - s * 0.15), vec2(cx + s * 0.6, y + s * 0.25), vec2(cx - s * 0.6, y + s * 0.25), hull);
+    // a sail
+    draw_line(cx, y - s * 0.15, cx, y - s * 1.2, s * 0.05, Color::new(0.45, 0.3, 0.2, 1.0));
+    draw_triangle(vec2(cx + s * 0.04, y - s * 1.15), vec2(cx + s * 0.04, y - s * 0.25), vec2(cx + s * 0.65, y - s * 0.25), WHITE);
+    draw_triangle(vec2(cx - s * 0.04, y - s * 0.95), vec2(cx - s * 0.04, y - s * 0.25), vec2(cx - s * 0.45, y - s * 0.25), Color::new(1.0, 0.85, 0.3, 1.0));
+    // waves
+    for k in 0..3 {
+        let x = cx - s * 0.75 + k as f32 * s * 0.55;
+        arc(x + s * 0.13, y + s * 0.38, s * 0.13, s * 0.06, 0.0, 180.0, Color::new(0.4, 0.7, 1.0, 1.0));
+    }
+}
+
+fn runway_icon(cx: f32, cy: f32, s: f32, time: f32) {
+    let grey = Color::new(0.3, 0.32, 0.35, 1.0);
+    let (y0, y1) = (cy - s * 0.1, cy + s * 0.95);
+    draw_triangle(vec2(cx - s * 0.18, y0), vec2(cx + s * 0.18, y0), vec2(cx + s * 0.75, y1), grey);
+    draw_triangle(vec2(cx - s * 0.18, y0), vec2(cx + s * 0.75, y1), vec2(cx - s * 0.75, y1), grey);
+    for k in 0..4 {
+        let t0 = k as f32 / 4.0 + 0.05;
+        let t1 = t0 + 0.12;
+        let (ya, yb) = (y0 + (y1 - y0) * t0, y0 + (y1 - y0) * t1);
+        draw_line(cx, ya, cx, yb, s * (0.02 + 0.04 * t0), WHITE);
+    }
+    // a little plane coming down to it
+    let f = (time * 0.4).fract();
+    let p = vec2(cx - s * 0.1 + f * s * 0.1, cy - s * 0.85 + f * s * 0.35);
+    let c = Color::new(1.0, 1.0, 1.0, 1.0 - f * 0.6);
+    draw_ellipse(p.x, p.y, s * 0.09, s * 0.3, 0.0, c);
+    draw_triangle(p + vec2(-s * 0.5, s * 0.02), p + vec2(s * 0.5, s * 0.02), p + vec2(0.0, -s * 0.1), c);
+    draw_triangle(p + vec2(-s * 0.2, s * 0.25), p + vec2(s * 0.2, s * 0.25), p + vec2(0.0, s * 0.18), c);
+}
+
+/// The picture for a mission.
+fn quest_icon(q: crate::kids::Quest, cx: f32, cy: f32, s: f32, time: f32) {
+    use crate::kids::{Landmark, Quest};
+    match q {
+        Quest::Balloons => balloon_icon(cx, cy - s * 0.25, s * 0.6, RAINBOW_C[0]),
+        Quest::Rainbows => rainbow_icon(cx, cy, s, false),
+        Quest::Find(Landmark::Lighthouse) => lighthouse_icon(cx, cy, s, time),
+        Quest::Find(Landmark::Windmills) => windmill_icon(cx, cy, s, time),
+        Quest::Find(Landmark::Boat) => boat_icon(cx, cy, s, time),
+        Quest::Land => runway_icon(cx, cy, s, time),
+    }
+}
+
+/// Big, friendly and all pictures: the mission and how far along it is, an arrow to where to
+/// go, stars for every mission done, and cheers.
+pub fn kids(h: &KidsHud) {
+    use crate::kids::{Quest, NEED_BALLOONS, RAINBOWS};
+    let (sw, sh) = (screen_width(), screen_height());
+    let u = ui();
+    let fs = (sh / 22.0).clamp(26.0, 44.0 * u);
+
+    if let Some(r) = &h.red {
+        red_card(h, r, fs);
+        if let Some((path, at, hdg, left)) = &h.track {
+            track_map(path, *at, *hdg, left, fs);
+        }
+        kids_rest(h, fs, fs * 3.4, false);
+        return;
+    }
+    // the mission card, top centre: its picture, then a slot for each thing to do
+    let icon = fs * 1.15;
+    let r = fs * 0.36;
+    let step = r * 2.3;
+    let slots = match h.quest {
+        Quest::Balloons => NEED_BALLOONS,
+        Quest::Rainbows => RAINBOWS,
+        _ => 0,
+    };
+    let slot_step = if h.quest == Quest::Rainbows { step * 1.6 } else { step };
+    let row_w = slot_step * slots as f32;
+    let cw = icon * 2.4 + row_w + fs * 0.8;
+    let ch = fs * 2.9;
+    let (cx0, top) = (sw / 2.0 - cw / 2.0, fs * 0.45);
+    let glow = h.done.map_or(0.0, |t| (1.0 - t / 4.0).max(0.0));
+    rrect(cx0, top, cw, ch, fs * 0.7, Color::new(0.0 + 0.3 * glow, 0.05 + 0.25 * glow, 0.12, 0.5));
+    let (ix, iy) = (cx0 + fs * 0.4 + icon, top + ch * 0.5);
+    quest_icon(h.quest, ix, iy, icon * if h.done.is_some() { 1.0 + 0.1 * (h.time * 8.0).sin().abs() } else { 1.0 }, h.time);
+    let x0 = ix + icon * 1.2;
+    for k in 0..slots {
+        let cx = x0 + slot_step * (k as f32 + 0.5);
+        let cy = top + ch * 0.45;
+        let newest = k + 1 == h.progress;
+        let bounce = if newest { 1.0 + 0.15 * (h.time * 6.0).sin().abs() } else { 1.0 };
+        if h.quest == Quest::Rainbows {
+            rainbow_icon(cx, cy, r * 1.3 * bounce, k >= h.progress);
+        } else if let Some(c) = h.colors.get(k) {
+            balloon_icon(cx, cy, r * bounce, Color::new(c[0], c[1], c[2], 1.0));
+        } else {
+            draw_ellipse_lines(cx, cy, r * 0.88, r * 1.05, 0.0, 2.0 * u, Color::new(1.0, 1.0, 1.0, 0.35));
+        }
+    }
+    if slots == 0 && h.done.is_some() {
+        // found it / landed: a big tick
+        let (tx, ty) = (cx0 + cw - fs * 1.3, top + ch * 0.5);
+        draw_line(tx - fs * 0.45, ty, tx - fs * 0.1, ty + fs * 0.35, fs * 0.18, GREEN_C);
+        draw_line(tx - fs * 0.1, ty + fs * 0.35, tx + fs * 0.5, ty - fs * 0.4, fs * 0.18, GREEN_C);
+    }
+
+    kids_rest(h, fs, top + ch, true);
+}
+
+/// 99 Red Balloons' card: a big red balloon, how many are popped, and the clock.
+fn red_card(h: &KidsHud, r: &RedHud, fs: f32) {
+    let (popped, time) = (r.popped, r.time);
+    use crate::kids::RED_TOTAL;
+    let sw = screen_width();
+    let (w, ch, top) = (fs * 11.0, fs * 2.9, fs * 0.45);
+    let x = sw / 2.0 - w / 2.0;
+    let glow = h.done.map_or(0.0, |t| (1.0 - t / 4.0).max(0.0));
+    rrect(x, top, w, ch, fs * 0.7, Color::new(0.3 * glow, 0.05 + 0.2 * glow, 0.12, 0.5));
+    let bounce = 1.0 + 0.08 * (h.time * 3.0).sin().abs();
+    balloon_icon(x + fs * 1.3, top + ch * 0.38, fs * 0.75 * bounce, Color::new(0.95, 0.1, 0.13, 1.0));
+    let n = popped.to_string();
+    let big = fs * 1.5;
+    text_b(&n, x + fs * 2.6, top + ch * 0.55, big, WHITE);
+    let nw = text_w(&n, big) * 1.04;
+    text(&format!("/ {RED_TOTAL}"), x + fs * 2.7 + nw, top + ch * 0.55, fs * 0.8, Color::new(1.0, 1.0, 1.0, 0.75));
+    let clock = crate::lessons::fmt_time(time);
+    let cw = text_w(&clock, fs * 0.9);
+    text_b(&clock, x + w - fs * 0.6 - cw, top + ch * 0.45, fs * 0.9, AMBER);
+    let mut small = Vec::new();
+    if r.missed > 0 {
+        small.push(format!("{} missed", r.missed));
+    }
+    if let Some(b) = r.best {
+        small.push(format!("best {}", crate::lessons::fmt_time(b)));
+    }
+    let s = small.join("   ");
+    let bw = text_w(&s, fs * 0.45);
+    text(&s, x + w - fs * 0.6 - bw, top + ch * 0.8, fs * 0.45, Color::new(1.0, 1.0, 1.0, 0.7));
+}
+
+/// A little map of the rainbow road, top right, like a racing game's: the road in rainbow
+/// colours, the balloons still to get, and you.
+fn track_map(path: &[Vec3], at: Vec3, hdg: f32, left: &[Vec3], fs: f32) {
+    let sw = screen_width();
+    let size = fs * 5.0;
+    let (x0, y0) = (sw - size - fs * 0.6, fs * 0.45);
+    rrect(x0 - fs * 0.3, y0 - fs * 0.3, size + fs * 0.6, size + fs * 0.6, fs * 0.5, Color::new(0.0, 0.05, 0.12, 0.45));
+    let (mut lo, mut hi) = (vec2(f32::MAX, f32::MAX), vec2(f32::MIN, f32::MIN));
+    for p in path {
+        lo = lo.min(vec2(p.x, p.z));
+        hi = hi.max(vec2(p.x, p.z));
+    }
+    let span = (hi - lo).max_element().max(1.0);
+    let mid = (lo + hi) * 0.5;
+    let to = |x: f32, z: f32| vec2(x0 + size / 2.0 + (x - mid.x) / span * size, y0 + size / 2.0 + (z - mid.y) / span * size);
+    let n = path.len();
+    for (k, w) in path.windows(2).enumerate().step_by(4) {
+        let (a, b) = (to(w[0].x, w[0].z), to(w[1].x, w[1].z));
+        let c = RAINBOW_C[(k * 6 / n.max(1)).min(5)];
+        let b = b + (b - a) * 3.0;
+        draw_line(a.x, a.y, b.x, b.y, fs * 0.16, c);
+    }
+    for b in left {
+        let p = to(b.x, b.z);
+        draw_circle(p.x, p.y, fs * 0.07, Color::new(1.0, 0.85, 0.85, 0.9));
+    }
+    // you: an arrowhead pointing the way you're flying
+    let p = to(at.x, at.z);
+    let a = hdg.to_radians();
+    let d = vec2(a.sin(), -a.cos());
+    let n2 = vec2(-d.y, d.x);
+    let s = fs * 0.3;
+    draw_triangle(p + d * s * 1.4, p - d * s * 0.7 + n2 * s, p - d * s * 0.7 - n2 * s, WHITE);
+}
+
+/// Everything in kids mode but the mission card: stars, the arrow, cheers, hints and buttons.
+/// `card_bottom` is where the card ends (the arrow keeps clear of it).
+fn kids_rest(h: &KidsHud, fs: f32, card_bottom: f32, show_stars: bool) {
+    let (sw, sh) = (screen_width(), screen_height());
+    let u = ui();
+    if show_stars {
+        // stars for every mission ever done, top left
+        let (sx, sy) = (fs * 1.2, fs * 1.3);
+        star(sx, sy, fs * 0.75, true, AMBER);
+        text_b(&h.stars.to_string(), sx + fs * 1.0, sy + fs * 0.4, fs * 1.1, WHITE);
+    }
+
+    // the big arrow: bobbing over the target when it's in view, at the edge when it isn't
+    if let Some((pos, c)) = h.target {
+        let p4 = h.view_proj * pos.extend(1.0);
+        let margin = fs * 1.5;
+        let on_screen = p4.w > 0.1 && {
+            let p = vec2((p4.x / p4.w * 0.5 + 0.5) * sw, (0.5 - p4.y / p4.w * 0.5) * sh);
+            p.x > margin && p.x < sw - margin && p.y > card_bottom + margin && p.y < sh - margin * 1.5
+        };
+        let s = fs * 0.55;
+        if on_screen {
+            let p = vec2((p4.x / p4.w * 0.5 + 0.5) * sw, (0.5 - p4.y / p4.w * 0.5) * sh);
+            let dist = (pos - h.eye).length();
+            // sit above the target, a bit further when it's close and big
+            let lift = (fs * 0.8 + 2500.0 / dist.max(30.0) * u).min(sh * 0.25) + (h.time * 5.0).sin().abs() * fs * 0.3;
+            let tip = p - vec2(0.0, lift);
+            let (a, b, t) = (tip + vec2(-s, -s * 1.3), tip + vec2(s, -s * 1.3), tip);
+            draw_triangle(a + vec2(0.0, -3.0 * u), b + vec2(0.0, -3.0 * u), t + vec2(0.0, 4.0 * u), WHITE);
+            draw_triangle(a, b, t, c);
+        } else {
+            let mut d = vec2(p4.x, -p4.y);
+            if p4.w <= 0.1 {
+                d = -d;
+            }
+            let d = d.try_normalize().unwrap_or(vec2(0.0, -1.0));
+            let ext = vec2(sw * 0.5 - margin * 1.5, sh * 0.5 - margin * 2.4);
+            let k = (ext.x / d.x.abs().max(1e-3)).min(ext.y / d.y.abs().max(1e-3));
+            let pulse = 1.0 + 0.12 * (h.time * 5.0).sin();
+            let p = vec2(sw / 2.0, sh / 2.0 + margin * 0.6) + d * k;
+            let perp = vec2(-d.y, d.x);
+            let (s, l) = (s * 1.3 * pulse, s * 2.2 * pulse);
+            draw_triangle(p + d * (l + 4.0 * u), p + perp * (s + 4.0 * u) - d * 2.0 * u, p - perp * (s + 4.0 * u) - d * 2.0 * u, WHITE);
+            draw_triangle(p + d * l, p + perp * s, p - perp * s, c);
+        }
+    }
+
+    // a mission done: a big star spins in behind the cheer
+    if let Some(t) = h.done {
+        let grow = smoothstep_f(0.0, 0.4, t) * (1.0 - smoothstep_f(3.2, 4.0, t));
+        if grow > 0.01 {
+            let r = sh * 0.13 * grow * (1.0 + 0.05 * (h.time * 6.0).sin());
+            let (cx, cy) = (sw / 2.0, sh * 0.36);
+            let a = t * 1.5;
+            for k in 0..12 {
+                let ray = a * 0.5 + k as f32 * std::f32::consts::TAU / 12.0;
+                let d = vec2(ray.cos(), ray.sin());
+                let n = vec2(-d.y, d.x);
+                draw_triangle(vec2(cx, cy) + n * r * 0.12, vec2(cx, cy) - n * r * 0.12, vec2(cx, cy) + d * r * 1.9, Color::new(1.0, 0.95, 0.6, 0.25 * grow));
+            }
+            star(cx, cy, r, true, AMBER);
+        }
+    }
+    // cheers and mission names pop in big and fade out
+    if let Some((msg, age)) = h.banner {
+        let grow = 1.0 + 0.4 * (1.0 - (age / 0.25).min(1.0)).powi(2);
+        let a = (3.0 - age).clamp(0.0, 0.5) * 2.0;
+        let bs = fs * 1.4 * grow;
+        let y = sh * 0.36 + if h.done.is_some() { sh * 0.19 } else { 0.0 };
+        text_cx(msg, sw / 2.0 + 4.0 * u, y + 4.0 * u, bs, Color::new(0.0, 0.0, 0.0, 0.4 * a), true);
+        let hue = Color::new(1.0, 0.85 + 0.15 * (h.time * 4.0).sin(), 0.3, a);
+        text_cx(msg, sw / 2.0, y, bs, hue, true);
+    }
+    if let Some(hint) = h.hint {
+        let a = 0.75 + 0.25 * (h.time * 3.0).sin();
+        pill(hint, sw / 2.0, sh - fs * 2.6, fs * 0.8, Color::new(1.0, 1.0, 1.0, a), Color::new(0.0, 0.05, 0.12, 0.5), true);
+    }
+
+    // the buttons, along the bottom (for whoever's helping)
+    let keys = if h.pad {
+        "LEFT STICK  fly (pull back to climb)      A  zoom      X  rainbow      Y  next plane      START  menu"
+    } else {
+        "ARROWS  fly (down to climb)      SPACE  zoom      X  rainbow      P  next plane      ESC  menu"
+    };
+    let ks = (fs * 0.42).min(fs * 0.42 * (sw - fs * 2.0) / text_w(keys, fs * 0.42));
+    pill(keys, sw / 2.0, sh - fs * 0.8, ks, Color::new(1.0, 1.0, 1.0, 0.85), Color::new(0.0, 0.05, 0.12, 0.45), false);
+    text(h.plane, fs * 0.6, sh - fs * 1.7, fs * 0.5, Color::new(1.0, 1.0, 1.0, 0.75));
+}
+
+fn smoothstep_f(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

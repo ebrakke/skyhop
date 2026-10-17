@@ -49,6 +49,10 @@ pub struct State {
     pub burner: f32,
     /// Sailplane variometer: climb rate in m/s, beeping faster and higher as you climb.
     pub vario: Option<f32>,
+    /// A helicopter's rotor (blade slap and turbine), 0..1.
+    pub rotor: f32,
+    /// A hot air balloon's burner, 0..1.
+    pub flame: f32,
 }
 
 impl Default for State {
@@ -74,6 +78,8 @@ impl Default for State {
             fan_hz: 83.0,
             burner: 0.0,
             vario: None,
+            rotor: 0.0,
+            flame: 0.0,
         }
     }
 }
@@ -93,6 +99,10 @@ enum Cue {
     AtOff,
     /// One word of a radio call; the first and last get a squelch click.
     Radio(Word, bool, bool),
+    /// A balloon popping, a note higher for each one.
+    Pop(u32),
+    /// Kids mode talking: right away (counting), or after whatever is being said.
+    Kid(Line, bool),
 }
 
 /// The tower controller's vocabulary (assets/atc, made by tools/callouts.sh).
@@ -154,9 +164,84 @@ impl Word {
     }
 }
 
-/// All the recorded clips: callouts, then the controller's words.
+/// Kids mode's friendly voice (assets/kids, made by tools/callouts.sh).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Line {
+    /// Counting the balloons, 1 to 10.
+    Count(u8),
+    Go,
+    Balloons,
+    Rainbows,
+    Lighthouse,
+    Boat,
+    Windmills,
+    Land,
+    Found,
+    Yay,
+    Hooray,
+    Great,
+    DidIt,
+    Landed,
+    Up,
+    Plane,
+    Heli,
+    HotAir,
+    Jet,
+    Fighter,
+    Glider,
+}
+
+const KID_WAVS: [&[u8]; 30] = [
+    include_bytes!("../assets/kids/n1.wav"),
+    include_bytes!("../assets/kids/n2.wav"),
+    include_bytes!("../assets/kids/n3.wav"),
+    include_bytes!("../assets/kids/n4.wav"),
+    include_bytes!("../assets/kids/n5.wav"),
+    include_bytes!("../assets/kids/n6.wav"),
+    include_bytes!("../assets/kids/n7.wav"),
+    include_bytes!("../assets/kids/n8.wav"),
+    include_bytes!("../assets/kids/n9.wav"),
+    include_bytes!("../assets/kids/n10.wav"),
+    include_bytes!("../assets/kids/go.wav"),
+    include_bytes!("../assets/kids/balloons.wav"),
+    include_bytes!("../assets/kids/rainbows.wav"),
+    include_bytes!("../assets/kids/lighthouse.wav"),
+    include_bytes!("../assets/kids/boat.wav"),
+    include_bytes!("../assets/kids/windmills.wav"),
+    include_bytes!("../assets/kids/land.wav"),
+    include_bytes!("../assets/kids/found.wav"),
+    include_bytes!("../assets/kids/yay.wav"),
+    include_bytes!("../assets/kids/hooray.wav"),
+    include_bytes!("../assets/kids/great.wav"),
+    include_bytes!("../assets/kids/did_it.wav"),
+    include_bytes!("../assets/kids/landed.wav"),
+    include_bytes!("../assets/kids/up.wav"),
+    include_bytes!("../assets/kids/plane.wav"),
+    include_bytes!("../assets/kids/heli.wav"),
+    include_bytes!("../assets/kids/hot_air.wav"),
+    include_bytes!("../assets/kids/jet.wav"),
+    include_bytes!("../assets/kids/fighter.wav"),
+    include_bytes!("../assets/kids/glider.wav"),
+];
+
+impl Line {
+    fn clip(self) -> usize {
+        CALLOUT_WAVS.len()
+            + ATC_WAVS.len()
+            + match self {
+                Line::Count(n) => n.clamp(1, 10) as usize - 1,
+                other => 9 + [Line::Go, Line::Balloons, Line::Rainbows, Line::Lighthouse, Line::Boat, Line::Windmills, Line::Land, Line::Found, Line::Yay, Line::Hooray, Line::Great, Line::DidIt, Line::Landed, Line::Up, Line::Plane, Line::Heli, Line::HotAir, Line::Jet, Line::Fighter, Line::Glider]
+                    .iter()
+                    .position(|l| *l == other)
+                    .unwrap_or(0)
+                    + 1,
+            }
+    }
+}
+
+/// All the recorded clips: callouts, the controller's words, then kids mode's voice.
 fn all_clips() -> Vec<Clip> {
-    CALLOUT_WAVS.iter().chain(ATC_WAVS.iter()).map(|b| decode_wav(b)).collect()
+    CALLOUT_WAVS.iter().chain(ATC_WAVS.iter()).chain(KID_WAVS.iter()).map(|b| decode_wav(b)).collect()
 }
 
 /// Spoken radio-altimeter and ground-proximity callouts (assets/callouts, made by tools/callouts.sh).
@@ -232,6 +317,9 @@ fn decode_wav(b: &[u8]) -> Clip {
 struct Shared {
     state: State,
     cues: Vec<Cue>,
+    /// Background music, and a count of changes so the audio thread notices a new one.
+    music: Option<Arc<crate::music::Song>>,
+    music_gen: u32,
 }
 
 pub struct Audio {
@@ -242,18 +330,23 @@ pub struct Audio {
 
 impl Audio {
     pub fn new() -> Self {
-        let shared = Arc::new(Mutex::new(Shared { state: State::default(), cues: Vec::with_capacity(32) }));
+        let shared = Arc::new(Mutex::new(Shared { state: State::default(), cues: Vec::with_capacity(32), music: None, music_gen: 0 }));
         let params = OutputDeviceParameters { sample_rate: RATE as usize, channels_count: 2, channel_sample_count: BLOCK };
         let device = run_output_device(params, {
             let shared = shared.clone();
             let mut synth = Synth::new();
             synth.clips = all_clips();
             let mut cues = Vec::with_capacity(32);
+            let mut music_gen = 0;
             move |data| {
                 // Never block the audio thread: if the game holds the lock, reuse the last state.
                 if let Ok(mut s) = shared.try_lock() {
                     synth.target = s.state;
                     std::mem::swap(&mut cues, &mut s.cues);
+                    if s.music_gen != music_gen {
+                        music_gen = s.music_gen;
+                        synth.music = s.music.clone().map(crate::music::Player::new);
+                    }
                 }
                 for c in cues.drain(..) {
                     synth.cue(c);
@@ -297,6 +390,22 @@ impl Audio {
     /// Flew through ring `n` (1-based): each one rings a note higher.
     pub fn ring(&self, n: usize) {
         self.send(Cue::Ring(n as u32));
+    }
+    /// A balloon popped (the `n`th in a row: each one a note higher).
+    pub fn pop(&self, n: usize) {
+        self.send(Cue::Pop(n as u32));
+    }
+    /// Start a song playing round and round in the background, or stop the music.
+    pub fn music(&self, song: Option<Arc<crate::music::Song>>) {
+        if let Ok(mut sh) = self.shared.lock() {
+            sh.music = song;
+            sh.music_gen = sh.music_gen.wrapping_add(1);
+        }
+    }
+
+    /// Kids mode's voice: `now` cuts in (for counting), otherwise it waits its turn.
+    pub fn kid(&self, line: Line, now: bool) {
+        self.send(Cue::Kid(line, now));
     }
     pub fn crash(&self) {
         self.send(Cue::Crash);
@@ -470,6 +579,10 @@ enum Kind {
     Speech { clip: usize, radio: bool },
     /// Warbling two-tone alarm.
     Wailer,
+    /// A rubbery snap and a little bloop: a balloon popping.
+    Pop,
+    /// A clip played clean, straight through (kids mode's voice).
+    Talk { clip: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -499,6 +612,8 @@ impl Voice {
             Kind::Speech { radio: false, .. } => (10.0, 0.04, Svf::new(1700.0, 0.45), Svf::default()),
             Kind::Speech { radio: true, .. } => (10.0, 0.02, Svf::new(1500.0, 1.1), Svf::new(2800.0, 0.8)),
             Kind::Wailer => (1.6, 0.05, Svf::default(), Svf::default()),
+            Kind::Pop => (0.3, 0.15, Svf::new(2400.0, 1.4), Svf::default()),
+            Kind::Talk { .. } => (10.0, 0.08, Svf::default(), Svf::default()),
         };
         Voice { kind, amp, t: -delay, len, ph: [0.0; 3], f1, f2, wet, pan: 0.0 }
     }
@@ -555,6 +670,14 @@ impl Voice {
                 let boom = (TAU * 42.0 * t).sin() * (-t / 0.18).exp() * 1.4;
                 (crunch + ring + debris * 0.7 + boom) * (t * 2000.0).min(1.0)
             }
+            Kind::Pop => {
+                self.f1.set(700.0 + 2600.0 * (-t / 0.03).exp(), 1.4);
+                let snap = self.f1.band(rng.next()) * (-t / 0.016).exp() * 2.2;
+                let f = 900.0 - 420.0 * (t / 0.09).min(1.0);
+                self.ph[0] = (self.ph[0] + f * dt).fract();
+                let bloop = (self.ph[0] * TAU).sin() * (-t / 0.06).exp() * 0.45;
+                (snap + bloop) * (t * 3000.0).min(1.0)
+            }
             Kind::Whoosh => {
                 let x = t / self.len;
                 let f = 350.0 + 2600.0 * (x * PI).sin().powi(2) * (1.0 - x * 0.5);
@@ -562,6 +685,16 @@ impl Voice {
                 let env = (x * PI).sin().powi(2);
                 self.pan = (x * 2.0 - 1.0) * 0.6;
                 self.f1.band(rng.next()) * env * 1.6
+            }
+            Kind::Talk { clip } => {
+                let c = &clips[clip];
+                let pos = t * c.rate;
+                let k = pos as usize;
+                if k + 1 >= c.samples.len() {
+                    return None;
+                }
+                let f = pos - k as f32;
+                c.samples[k] * (1.0 - f) + c.samples[k + 1] * f
             }
             Kind::Speech { clip, radio } => {
                 let c = &clips[clip];
@@ -600,6 +733,7 @@ impl Voice {
 struct Synth {
     target: State,
     clips: Vec<Clip>,
+    music: Option<crate::music::Player>,
     // turbofans
     n1: f32,
     rev: f32,
@@ -611,6 +745,11 @@ struct Synth {
     jet_rumble: Svf,
     gear_prev: f32,
     burner: f32,
+    rotor: f32,
+    rotor_ph: f32,
+    rotor_noise: Svf,
+    flame: f32,
+    flame_noise: Svf,
     vario: f32,
     vario_ph: f32,
     vario_beep: f32,
@@ -678,6 +817,7 @@ impl Synth {
         Synth {
             target: State::default(),
             clips: Vec::new(),
+            music: None,
             n1: 0.0,
             rev: 0.0,
             fan_ph: 0.0,
@@ -688,6 +828,11 @@ impl Synth {
             jet_rumble: Svf::new(70.0, 0.8),
             gear_prev: 1.0,
             burner: 0.0,
+            rotor: 0.0,
+            rotor_ph: 0.0,
+            rotor_noise: Svf::new(260.0, 0.9),
+            flame: 0.0,
+            flame_noise: Svf::new(420.0, 0.6),
             vario: 0.0,
             vario_ph: 0.0,
             vario_beep: 0.0,
@@ -771,6 +916,28 @@ impl Synth {
                 const SCALE: [f32; 10] = [440.0, 493.88, 554.37, 659.26, 739.99, 880.0, 987.77, 1108.7, 1318.5, 1480.0];
                 self.voice(Kind::Whoosh, 0.35, 0.0);
                 self.voice(Kind::Bell { f: SCALE[(n as usize).saturating_sub(1) % 10] }, 0.32, 0.05);
+            }
+            Cue::Pop(n) => {
+                const SCALE: [f32; 10] = [523.25, 587.33, 659.26, 783.99, 880.0, 1046.5, 1174.66, 1318.5, 1568.0, 1760.0];
+                self.voice(Kind::Pop, 0.55, 0.0);
+                self.voice(Kind::Bell { f: SCALE[(n as usize).saturating_sub(1) % 10] }, 0.26, 0.04);
+            }
+            Cue::Kid(line, now) => {
+                let clip = line.clip();
+                let talking = |v: &Voice| match v.kind {
+                    Kind::Talk { clip } => Some(self.clips[clip].samples.len() as f32 / self.clips[clip].rate - v.t),
+                    _ => None,
+                };
+                let busy = self.voices.iter().filter_map(talking).fold(0.0f32, f32::max);
+                if clip < self.clips.len() {
+                    if now {
+                        // counting cuts in over whatever was being said
+                        self.voices.retain(|v| !matches!(v.kind, Kind::Talk { .. }));
+                        self.voice(Kind::Talk { clip }, 0.8, 0.0);
+                    } else if busy < 4.0 {
+                        self.voice(Kind::Talk { clip }, 0.8, busy + 0.15);
+                    }
+                }
             }
             Cue::Crash => self.voice(Kind::Crash, 0.75, 0.0),
             Cue::Touchdown(s) => {
@@ -948,6 +1115,23 @@ impl Synth {
                 (eng, prop)
             };
 
+            // --- helicopter: the main rotor's blade slap and a turbine whine; a hot air
+            // balloon's burner roar ---
+            self.rotor += (p.rotor - self.rotor) * k_slow;
+            self.flame += (p.flame - self.flame) * k_mid;
+            let mut eng = eng;
+            if self.rotor > 0.001 {
+                self.rotor_ph = (self.rotor_ph + 10.5 * self.doppler * dt).fract();
+                let d = (self.rotor_ph - 0.5) / 0.07;
+                let slap = (-d * d).exp();
+                self.core_ph = (self.core_ph + 1400.0 * self.doppler * dt).fract();
+                let whine = (self.core_ph * TAU).sin() * 0.02;
+                eng += (self.rotor_noise.band(pink[1]) * 2.5 * (0.25 + slap) + (self.rotor_ph * TAU).sin() * slap * 0.35 + whine) * self.rotor;
+            }
+            if self.flame > 0.001 {
+                eng += (self.flame_noise.low(pink[2]) * 2.0 + pink[0] * 0.15) * self.flame;
+            }
+
             // --- airframe ---
             let speed = (self.air / 60.0).max(0.0);
             let wind_amp = speed.powf(2.2).min(2.0) * (0.75 + 0.4 * self.gust) * (1.0 + 2.0 * self.slip.abs()) * (1.0 - 0.45 * self.inside);
@@ -1032,9 +1216,11 @@ impl Synth {
                     }
                 }
             }
+            let music = self.music.as_mut().map_or(0.0, |p| p.sample()) * 0.55;
+            wet += music * 0.15;
             for c in 0..2 {
                 let s = self.cabin[c].low(craft + wind[c] * m[L_WIND] * close) + (horn + vario) * m[L_HORN] * close;
-                lr[c] = s + (voices_lr[c] + self.room[c].tick(wet)) * m[L_CUES];
+                lr[c] = s + (voices_lr[c] + self.room[c].tick(wet)) * m[L_CUES] + music;
             }
             for c in 0..2 {
                 // remove DC, then a soft limiter keeps big moments from clipping
