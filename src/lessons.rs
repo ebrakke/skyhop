@@ -1,11 +1,17 @@
 //! Guided lessons, the ring challenge and free flight.
 
-use crate::flight::{Touchdown, Telem, FT};
+use crate::flight::{Craft, Speedbrake, Touchdown, Telem, FT};
+use crate::weather::Weather;
 use crate::world::*;
 use macroquad::math::{vec3, Vec3};
 
+#[derive(Clone, Copy)]
 pub enum Start {
+    /// Lined up on runway 09.
     Runway,
+    Runway27,
+    /// Parked on the ground at (x, z) facing a heading.
+    Ground { x: f32, z: f32, heading: f32 },
     Air { pos: Vec3, heading: f32, ias: f32, gamma: f32, flaps: u8, trim_offset: f32 },
 }
 
@@ -13,6 +19,8 @@ pub enum Start {
 pub enum Kind {
     Lesson,
     Rings,
+    /// Land and stop on the runway; graded on a scorecard.
+    Landing,
     Free,
 }
 
@@ -36,6 +44,13 @@ pub struct Step {
 
 pub struct Lesson {
     pub name: &'static str,
+    pub craft: Craft,
+    /// Approach speed to mark on the airspeed indicator.
+    pub vref: Option<f32>,
+    /// Conditions for this lesson; None means a pleasant default day.
+    pub weather: Option<Weather>,
+    /// Starts with the engine failed.
+    pub engine_out: bool,
     pub blurb: &'static str,
     pub start: Start,
     pub kind: Kind,
@@ -59,6 +74,11 @@ pub fn papi_lights() -> [(Vec3, f32); 4] {
     std::array::from_fn(|i| (vec3(x, RWY_ELEV, -(RWY_HALF_W + 14.0 + i as f32 * 9.0)), ang[i]))
 }
 
+/// On the 3 degree glide path to runway 09, `d` metres before the touchdown point.
+pub fn on_final(d: f32) -> Vec3 {
+    vec3(-RWY_HALF_LEN + PAPI_DIST - d, RWY_ELEV + 3.0 + d * 3f32.to_radians().tan(), 0.0)
+}
+
 /// Angle (deg) of the aircraft above the runway-09 PAPI, as seen from the lights.
 pub fn glide_angle(pos: Vec3) -> f32 {
     let x = -RWY_HALF_LEN + PAPI_DIST;
@@ -66,16 +86,38 @@ pub fn glide_angle(pos: Vec3) -> f32 {
     (pos.y - 1.4 - RWY_ELEV).atan2(dx).to_degrees()
 }
 
+/// ILS needles for runway 09 in dots (+-2 full scale), or None when not on the approach:
+/// (localizer, glideslope). Localizer is positive when the centerline is to the right of the
+/// aircraft; glideslope positive when the glide path is above it (you're low).
+pub fn ils(pos: Vec3, hdg: f32) -> Option<(f32, f32)> {
+    let loc_x = RWY_HALF_LEN + 300.0; // the localizer antenna sits beyond the far end
+    let on_final = pos.x < -RWY_HALF_LEN + PAPI_DIST && pos.x > -RWY_HALF_LEN - 20_000.0 && hdg_err(hdg, 90.0) < 90.0;
+    let off = pos.z.atan2(loc_x - pos.x).to_degrees();
+    if !on_final || off.abs() > 12.0 {
+        return None;
+    }
+    let loc = (-off / 1.25).clamp(-2.5, 2.5);
+    let gs = ((3.0 - glide_angle(pos)) / 0.35).clamp(-2.5, 2.5);
+    Some((loc, gs))
+}
+
 fn no_summary(_: &Scratch, _: Option<Touchdown>) -> Vec<String> {
     Vec::new()
 }
 
 const CRUISE_ALT: f32 = 4000.0;
+/// 737 approach speed (flaps 30 at landing weight) and the length of the final approach, m.
+const JET_VREF: f32 = 140.0;
+const JET_FINAL: f32 = 7000.0;
 
 pub fn all() -> Vec<Lesson> {
     vec![
         Lesson {
             name: "1. First Flight: Takeoff",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Power up, roll down the runway, rotate and climb away.",
             start: Start::Runway,
             kind: Kind::Lesson,
@@ -108,21 +150,25 @@ pub fn all() -> Vec<Lesson> {
         },
         Lesson {
             name: "2. Straight & Level, and Trim",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Use trim to fly hands-off and hold altitude and heading.",
             start: Start::Air { pos: vec3(-500.0, CRUISE_ALT * FT, 3000.0), heading: 0.0, ias: 100.0, gamma: 0.0, flaps: 0, trim_offset: -0.04 },
             kind: Kind::Lesson,
             steps: vec![
-                step("Feel the trim", "Let go of the stick and watch: the nose slowly drops because the plane is trimmed nose-down. Hold T (nose-up trim) until the vertical speed gauge (VSI) stays near zero with the stick centered.", 5.0,
+                step("Feel the trim", "Let go of the stick and watch: the nose slowly drops because the plane is trimmed nose-down. Hold T (nose-up trim) - the green TRIM readout shows the speed the plane will settle at. Bring it back to about 100 kt and let the vertical speed (VSI) settle near zero.", 5.0,
                     |t| t.stick_pitch.abs() < 0.05 && t.vs_fpm.abs() < 150.0,
                     |t| if t.stick_pitch.abs() > 0.05 { Some("Let go of W / S - let the trim do the work.") }
-                        else if t.vs_fpm < -200.0 { Some("Descending: hold T for nose-up trim.") }
-                        else if t.vs_fpm > 200.0 { Some("Climbing: hold G for nose-down trim.") } else { None }),
+                        else if t.vs_fpm < -200.0 { Some("Descending: T for nose-up trim (tap for fine steps), then give it a few seconds.") }
+                        else if t.vs_fpm > 200.0 { Some("Climbing: G for nose-down trim (tap for fine steps), then give it a few seconds.") } else { None }),
                 step("Hold it steady", "Keep within 100 ft of 4,000 ft and within 10 degrees of heading 360 for 20 seconds. Pick a spot on the horizon and keep the nose on it. Small corrections!", 20.0,
                     |t| (t.alt_ft - CRUISE_ALT).abs() < 100.0 && hdg_err(t.hdg, 0.0) < 10.0,
                     |t| if t.alt_ft < CRUISE_ALT - 100.0 { Some("Too low - raise the nose a touch and climb back to 4,000 ft.") }
                         else if t.alt_ft > CRUISE_ALT + 100.0 { Some("Too high - lower the nose a touch.") }
                         else if hdg_err(t.hdg, 0.0) >= 10.0 { Some("Turn back to heading 360 (N) with a gentle bank.") } else { None }),
-                step("Slow down, stay level", "Reduce power to about 55%. The plane slows and starts to sink - raise the nose a bit and re-trim (T) to hold 4,000 ft at the slower speed.", 6.0,
+                step("Slow down, stay level", "Reduce power to about 55%. The plane slows and starts to sink - raise the nose a bit and re-trim (T) to about 80 kt to hold 4,000 ft at the slower speed.", 6.0,
                     |t| t.throttle < 0.6 && t.vs_fpm.abs() < 150.0 && (t.alt_ft - CRUISE_ALT).abs() < 150.0 && t.ias_kt < 92.0,
                     |t| if t.throttle >= 0.6 { Some("Pull the power back to about 55% (CTRL or -).") }
                         else if (t.alt_ft - CRUISE_ALT).abs() >= 150.0 { Some("Get back to 4,000 ft.") }
@@ -132,6 +178,10 @@ pub fn all() -> Vec<Lesson> {
         },
         Lesson {
             name: "3. Turns",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Bank to turn, hold altitude, and keep the ball centered.",
             start: Start::Air { pos: vec3(-1500.0, CRUISE_ALT * FT, 0.0), heading: 0.0, ias: 100.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
             kind: Kind::Lesson,
@@ -167,6 +217,10 @@ pub fn all() -> Vec<Lesson> {
         },
         Lesson {
             name: "4. Climbs & Descents",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Pitch for airspeed, power for altitude.",
             start: Start::Air { pos: vec3(-2500.0, 3500.0 * FT, 1500.0), heading: 90.0, ias: 95.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
             kind: Kind::Lesson,
@@ -196,6 +250,10 @@ pub fn all() -> Vec<Lesson> {
         },
         Lesson {
             name: "5. Stalls",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "See what a stall is, hear the warning, and recover.",
             start: Start::Air { pos: vec3(1500.0, 4200.0 * FT, -1500.0), heading: 270.0, ias: 90.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
             kind: Kind::Lesson,
@@ -227,6 +285,10 @@ pub fn all() -> Vec<Lesson> {
         },
         Lesson {
             name: "6. Landing",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Fly the final approach, flare, and touch down.",
             start: Start::Air {
                 pos: vec3(-RWY_HALF_LEN + PAPI_DIST - 2700.0, RWY_ELEV + 1.4 + 2700.0 * 3f32.to_radians().tan(), 0.0),
@@ -271,7 +333,203 @@ pub fn all() -> Vec<Lesson> {
             },
         },
         Lesson {
+            name: "Sailplane: ride a thermal",
+            craft: Craft::Glider,
+            vref: None,
+            weather: Some(Weather { wind_from: 70.0, wind_kt: 5.0, turbulence: 0.2, clouds: 0.45, cloud_base_ft: 5500.0, hour: 14.0, thermals: 1.0, ..Default::default() }),
+            engine_out: false,
+            blurb: "No engine - just rising air. Find a thermal, circle in it to climb, then glide home and land.",
+            start: Start::Air { pos: vec3(-2500.0, 700.0, 2200.0), heading: 30.0, ias: 50.0, gamma: -2.0, flaps: 0, trim_offset: 0.0 },
+            kind: Kind::Lesson,
+            steps: vec![
+                step("Find rising air", "Thermals rise under cumulus clouds and over sunny fields - the swirls on the map show where. Fly straight toward one at 50 kt. The variometer beeps when you're going up.", 4.0,
+                    |t| t.vario > 1.0,
+                    |t| if t.ias_kt > 65.0 { Some("Slow down to about 50 kt - fast flying wastes height.") } else if t.vario < -1.5 { Some("Sinking air - keep going, lift is often next to sink.") } else { None }),
+                step("Circle and climb", "Bank 30-40 degrees and keep turning, centred where the beeps are fastest. If the lift fades, shift your circle toward the stronger side. Climb above 3,300 ft.", 0.0,
+                    |t| t.alt_ft > 3300.0,
+                    |t| if t.bank.abs() < 20.0 && t.vario > 0.5 { Some("Lift! Roll into a steady turn (30-40 degrees) to stay in it.") }
+                        else if t.ias_kt < 42.0 { Some("Too slow in the turn - lower the nose a little.") }
+                        else if t.vario < -0.5 { Some("Lost it - straighten out, then turn back toward where it was strongest.") } else { None }),
+                step("Glide home and land", "Head for runway 09, fly 50 kt, and use the airbrakes (X) to come down onto the runway. Touch down on the main wheel and roll to a stop.", 0.0,
+                    |t| t.on_ground && t.gs_kt < 3.0,
+                    |t| if t.ias_kt > 70.0 { Some("Slow down: 50 kt is the best glide.") } else { None }),
+            ],
+            summary: |_, td| match td {
+                None => vec!["Landed.".into()],
+                Some(td) => vec![format!("Touchdown {:.0} fpm. Soaring pilots fly for hours on this - well done.", td.sink_fpm)],
+            },
+        },
+        Lesson {
+            name: "737 MAX 8: Landing",
+            craft: Craft::Jet,
+            vref: Some(JET_VREF),
+            weather: None,
+            engine_out: false,
+            blurb: "Hand-fly a 62-tonne airliner down the glide path, flare, and stop on the runway.",
+            start: Start::Air {
+                pos: vec3(-RWY_HALF_LEN + PAPI_DIST - JET_FINAL, RWY_ELEV + 2.9 + JET_FINAL * 3f32.to_radians().tan(), 0.0),
+                heading: 90.0, ias: JET_VREF + 5.0, gamma: -3.0, flaps: 7, trim_offset: 0.0,
+            },
+            kind: Kind::Lesson,
+            steps: vec![
+                Step {
+                    track: |t, s, _| s.f[0] = s.f[0].max((t.ias_kt - (JET_VREF + 5.0)).abs()),
+                    ..step("Stabilized approach", "You're on a 4-mile final for runway 09: gear down, flaps 30, speedbrake armed. Hold 145 kt (the pink bug + 5) with pitch, and stay on the glide path with thrust: two white, two red on the PAPI. The engines take seconds to spool - small, early thrust changes. The diamonds on the attitude indicator show the glide path and centerline.", 0.0,
+                        |t| t.pos.x > -RWY_HALF_LEN - 150.0,
+                        |t| {
+                            let a = glide_angle(t.pos);
+                            if t.gear < 0.99 { Some("Gear down! (L)") }
+                            else if t.speedbrake != Speedbrake::Armed && !t.on_ground { Some("Arm the speedbrake (X) so it deploys on touchdown.") }
+                            else if t.ias_kt < JET_VREF - 3.0 { Some("Slow! Add thrust and lower the nose a touch.") }
+                            else if t.ias_kt > JET_VREF + 15.0 { Some("Fast - ease the thrust back.") }
+                            else if a > 3.5 { Some("High (all white): reduce thrust a little and let it settle.") }
+                            else if a < 2.5 { Some("Low (all red): add thrust, hold the attitude.") }
+                            else if t.pos.z.abs() > 30.0 { Some("Line up with the centerline - small bank, then roll level.") } else { None }
+                        })
+                },
+                step("Flare and touch down", "Aim for the white blocks 400 m in. Around 30 ft bring the thrust to idle and raise the nose 2-3 degrees to flare. Don't float - airliners land firmly in the touchdown zone. Over 10 degrees of pitch the tail hits the runway.", 0.5,
+                    |t| t.on_ground,
+                    |t| if t.agl_ft < 30.0 && t.throttle > 0.1 { Some("Thrust to idle (CTRL).") }
+                        else if t.agl_ft < 40.0 && t.vs_fpm < -800.0 { Some("Flare! Raise the nose a little (S).") }
+                        else if t.pitch > 8.0 && !t.on_ground { Some("Careful - tail strike above 10 degrees!") } else { None }),
+                Step {
+                    track: |t, s, _| s.f[1] = t.pos.x,
+                    ..step("Stop on the runway", "Speedbrakes pop up by themselves. Keep holding CTRL at idle for reverse thrust, brake with B (or the triggers), and keep straight with Q / E. Below 60 kt push the thrust lever up (SHIFT) to stow the reversers.", 0.0,
+                        |t| t.on_ground && t.gs_kt < 3.0,
+                        |t| if t.pos.z.abs() > 8.0 { Some("Steer back to the centerline (Q / E).") }
+                            else if t.reverser < 0.5 && t.ias_kt > 80.0 { Some("Reverse thrust: keep holding CTRL at idle.") }
+                            else if t.reverser > 0.5 && t.ias_kt < 60.0 { Some("Stow the reversers below 60 kt (SHIFT).") }
+                            else if t.brake < 0.5 && t.ias_kt < 100.0 { Some("Brakes: hold B or squeeze the triggers.") } else { None })
+                },
+            ],
+            summary: |s, td| match td {
+                None => vec!["Landed.".into()],
+                Some(td) => {
+                    let grade = match td.sink_fpm {
+                        f if f < 240.0 => "Smooth - a nice firm-but-gentle arrival.",
+                        f if f < 400.0 => "A normal airline landing.",
+                        f if f < 600.0 => "Firm. Passengers noticed - flare a touch earlier.",
+                        _ => "Hard landing: that one gets written up for an inspection.",
+                    };
+                    let past = td.pos.x + RWY_HALF_LEN;
+                    let zone = if past < 0.0 {
+                        format!("Touched down {:.0} m SHORT of the runway!", -past)
+                    } else if past < 250.0 || past > 900.0 {
+                        format!("Touched down {past:.0} m in - outside the touchdown zone (250-900 m).")
+                    } else {
+                        format!("Touched down {past:.0} m in, right in the touchdown zone.")
+                    };
+                    vec![
+                        format!("{:.0} fpm at {:.0} kt, {:.1} deg nose up.", td.sink_fpm, td.ias_kt, td.pitch),
+                        grade.into(),
+                        zone,
+                        format!("Stopped {:.0} m after touchdown, {:.0} m of runway left. Speed held within {:.0} kt on final.", s.f[1] - td.pos.x, RWY_HALF_LEN - s.f[1], s.f[0]),
+                    ]
+                }
+            },
+        },
+        Lesson {
+            name: "Crosswind: 737 in a 20 kt crosswind",
+            craft: Craft::Jet,
+            vref: Some(JET_VREF + 5.0),
+            weather: Some(Weather { wind_from: 30.0, wind_kt: 20.0, gust_kt: 6.0, turbulence: 0.3, clouds: 0.4, ..Default::default() }),
+            engine_out: false,
+            blurb: "Wind from 030 at 20 gusting 26. Crab into the wind on final, then kick the nose straight with rudder just before touchdown.",
+            start: Start::Air { pos: on_final(7400.0), heading: 90.0, ias: JET_VREF + 10.0, gamma: -3.0, flaps: 7, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "Gusty trainer arrival",
+            craft: Craft::Cessna,
+            vref: Some(70.0),
+            weather: Some(Weather { wind_from: 130.0, wind_kt: 14.0, gust_kt: 9.0, turbulence: 0.45, clouds: 0.5, cloud_base_ft: 2500.0, ..Default::default() }),
+            engine_out: false,
+            blurb: "Wind 130 at 14 gusting 23 and a bumpy final. Add half the gust to your approach speed and keep flying the plane all the way to the stop.",
+            start: Start::Air { pos: on_final(3700.0), heading: 90.0, ias: 75.0, gamma: -3.0, flaps: 2, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "Night ILS: 737",
+            craft: Craft::Jet,
+            vref: Some(JET_VREF),
+            weather: Some(Weather { wind_from: 80.0, wind_kt: 8.0, gust_kt: 0.0, turbulence: 0.1, clouds: 0.2, hour: 22.5, visibility_km: 25.0, ..Default::default() }),
+            engine_out: false,
+            blurb: "10 miles out at night. Follow the approach lights to the runway - or arm APP (4) with the autopilot (Z) and let it land.",
+            start: Start::Air { pos: on_final(18500.0), heading: 90.0, ias: JET_VREF + 5.0, gamma: -3.0, flaps: 7, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "Low cloud: ILS to minimums",
+            craft: Craft::Jet,
+            vref: Some(JET_VREF),
+            weather: Some(Weather { wind_from: 100.0, wind_kt: 10.0, gust_kt: 0.0, turbulence: 0.2, clouds: 0.95, cloud_base_ft: 350.0, visibility_km: 3.0, hour: 9.0, thermals: 0.0 }),
+            engine_out: false,
+            blurb: "Overcast at 350 ft. Fly the ILS diamonds through the murk; the runway appears just above minimums (\"minimums\" at 200 ft).",
+            start: Start::Air { pos: on_final(11000.0), heading: 90.0, ias: JET_VREF + 5.0, gamma: -3.0, flaps: 7, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "Engine failure: glide it in",
+            craft: Craft::Cessna,
+            vref: Some(65.0),
+            weather: Some(Weather { wind_from: 90.0, wind_kt: 6.0, turbulence: 0.15, ..Default::default() }),
+            engine_out: true,
+            blurb: "The engine has quit at 1,800 ft, 5 km from runway 09. Pitch for 65 kt (best glide) and plan your descent - there's no second try.",
+            start: Start::Air { pos: vec3(-RWY_HALF_LEN - 5000.0, RWY_ELEV + 550.0, 900.0), heading: 80.0, ias: 70.0, gamma: -4.0, flaps: 0, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "F-16: Overhead break and land",
+            craft: Craft::Fighter,
+            vref: Some(145.0),
+            weather: Some(Weather { wind_from: 80.0, wind_kt: 8.0, turbulence: 0.15, clouds: 0.2, ..Default::default() }),
+            engine_out: false,
+            blurb: "Run in over runway 09 at 1,500 ft and 350 kt. Break left hard, gear and flaps down on the downwind, a curving final, land at 11 degrees nose-up.",
+            start: Start::Air { pos: vec3(-RWY_HALF_LEN - 5000.0, RWY_ELEV + 460.0, 0.0), heading: 90.0, ias: 350.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "Sailplane: final glide",
+            craft: Craft::Glider,
+            vref: Some(55.0),
+            weather: Some(Weather { wind_from: 100.0, wind_kt: 8.0, turbulence: 0.2, thermals: 0.0, ..Default::default() }),
+            engine_out: false,
+            blurb: "No engine, one chance. 5 km out at 1,300 ft: fly 50 kt for the best glide, then use the airbrakes (X) to steepen the approach once you've made the runway.",
+            start: Start::Air { pos: vec3(-RWY_HALF_LEN - 4600.0, RWY_ELEV + 400.0, -300.0), heading: 85.0, ias: 50.0, gamma: -2.0, flaps: 0, trim_offset: 0.0 },
+            kind: Kind::Landing,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
+            name: "F-16: Ring Challenge",
+            craft: Craft::Fighter,
+            vref: None,
+            weather: None,
+            engine_out: false,
+            blurb: "The ring course at 400 knots. Pull hard - but not past 9 g.",
+            start: Start::Air { pos: RING_START, heading: 90.0, ias: 330.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
+            kind: Kind::Rings,
+            steps: vec![],
+            summary: no_summary,
+        },
+        Lesson {
             name: "Ring Challenge",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
             blurb: "Race through the rings around the island. Beat your best time!",
             start: Start::Air { pos: RING_START, heading: 90.0, ias: 105.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
             kind: Kind::Rings,
@@ -279,17 +537,13 @@ pub fn all() -> Vec<Lesson> {
             summary: no_summary,
         },
         Lesson {
-            name: "Free Flight: from the runway",
-            blurb: "Lined up on runway 09. The sky is yours.",
+            name: "Free Flight",
+            craft: Craft::Cessna,
+            vref: None,
+            weather: None,
+            engine_out: false,
+            blurb: "Any aircraft, anywhere, any weather - set it up and go.",
             start: Start::Runway,
-            kind: Kind::Free,
-            steps: vec![],
-            summary: no_summary,
-        },
-        Lesson {
-            name: "Free Flight: airborne",
-            blurb: "Start cruising at 3,000 ft west of the airport.",
-            start: Start::Air { pos: vec3(-3500.0, 3000.0 * FT, 800.0), heading: 90.0, ias: 100.0, gamma: 0.0, flaps: 0, trim_offset: 0.0 },
             kind: Kind::Free,
             steps: vec![],
             summary: no_summary,
@@ -323,6 +577,14 @@ impl Mission {
         self.time += dt;
         match lesson.kind {
             Kind::Free => None,
+            Kind::Landing => {
+                // done once down and stopped (the scorecard is filled in by the caller)
+                if touchdown.is_some() && t.on_ground && t.gs_kt < 2.0 {
+                    self.complete = true;
+                    return Some(Event::LessonDone);
+                }
+                None
+            }
             Kind::Rings => {
                 let ring = &world.rings[self.next_ring];
                 let (d0, d1) = ((prev - ring.pos).dot(ring.normal), (t.pos - ring.pos).dot(ring.normal));
@@ -389,7 +651,7 @@ mod tests {
         let world = World::generate();
         let lessons = all();
         let lesson = &lessons[0];
-        let mut ac = Aircraft::on_ground_at(&world.terrain, -RWY_HALF_LEN + 25.0, 0.0, 90.0);
+        let mut ac = Aircraft::on_ground_at(Craft::Cessna, &world.terrain, -RWY_HALF_LEN + 25.0, 0.0, 90.0);
         let mut m = Mission::default();
         let mut best = None;
         let dt = 1.0 / 240.0;
@@ -434,7 +696,7 @@ mod tests {
     fn approach_path_is_clear() {
         let world = World::generate();
         let t = &world.terrain;
-        for i in 0..100 {
+        for i in 0..250 {
             let d = i as f32 * 30.0;
             let x = -RWY_HALF_LEN + PAPI_DIST - d;
             let glide = RWY_ELEV + d * 3f32.to_radians().tan();
@@ -448,7 +710,7 @@ mod tests {
         let lessons = all();
         let lesson = &lessons[5];
         let Start::Air { pos, heading, ias, gamma, flaps, .. } = lesson.start else { panic!() };
-        let mut ac = Aircraft::in_flight(pos, heading, ias, gamma, flaps);
+        let mut ac = Aircraft::in_flight(Craft::Cessna, pos, heading, ias, gamma, flaps);
         let mut m = Mission::default();
         let mut best = None;
         let dt = 1.0 / 240.0;
@@ -486,5 +748,86 @@ mod tests {
         }
         assert!(m.complete, "stuck at step {}", m.step);
         println!("landing summary: {:?}", m.summary);
+    }
+
+    /// Flies the 737 landing lesson in the given weather; returns the summary and callouts.
+    fn fly_737_landing(weather: crate::weather::Weather) -> (Vec<String>, Vec<crate::audio::Callout>) {
+        let world = World::generate();
+        let lessons = all();
+        let idx = lessons.iter().position(|l| l.craft == Craft::Jet && l.kind == Kind::Lesson).unwrap();
+        let lesson = &lessons[idx];
+        let Start::Air { pos, heading, ias, gamma, flaps, .. } = lesson.start else { panic!() };
+        let mut ac = Aircraft::in_flight(Craft::Jet, pos, heading, ias, gamma, flaps);
+        let mut m = Mission::default();
+        let mut gpws = crate::gpws::Gpws::default();
+        let mut said = Vec::new();
+        let mut best = None;
+        let dt = 1.0 / 240.0;
+        let mut prev = ac.pos;
+        let mut time = 0.0;
+        for _ in 0..(240 * 300) {
+            let t = ac.telem(&world.terrain);
+            if let Some(c) = gpws.update(&t, ils(t.pos, t.hdg).map(|d| d.1), dt) {
+                said.push(c);
+            }
+            let q = ac.omega.x;
+            let c = &mut ac.ctl;
+            if t.agl_ft > 40.0 && !t.on_ground {
+                // thrust for the glide path, pitch for speed
+                let err = glide_angle(t.pos) - 3.0;
+                c.throttle = (0.4 - err * 0.25 + (JET_VREF + 5.0 - t.ias_kt) * 0.01).clamp(0.0, 1.0);
+                let want_pitch = 2.3 + (t.ias_kt - (JET_VREF + 5.0)) * 0.15;
+                c.pitch = ((want_pitch - t.pitch) * 0.08 - q * 2.0).clamp(-0.5, 0.5);
+            } else if !t.on_ground {
+                // flare: trade the descent rate down as the runway comes up
+                c.throttle = 0.0;
+                let want_vs = -120.0 - t.agl_ft * 14.0;
+                c.pitch = ((want_vs - t.vs_fpm) * 0.0012 + (2.5 - t.pitch) * 0.03 - q * 2.0).clamp(-0.3, 0.8);
+            } else {
+                c.throttle = 0.0;
+                c.pitch = 0.0;
+                c.reverse = if t.ias_kt > 60.0 { 1.0 } else { 0.0 };
+                c.brake = 1.0;
+            }
+            // track the centerline (crabbing into the wind), then kick out the crab in the flare
+            let want_bank = if t.on_ground || t.agl_ft < 15.0 { 0.0 } else { (-t.pos.z * 0.06 - (ac.vel.z / ac.vel.x.max(1.0)).atan().to_degrees() * 1.5).clamp(-15.0, 15.0) };
+            c.roll = ((want_bank - t.bank) * 0.05).clamp(-0.5, 0.5);
+            c.yaw = if t.on_ground || t.agl_ft < 25.0 { (-t.pos.z * 0.04 - (t.hdg - 90.0) * 0.12 - t.turn_rate * 0.25).clamp(-1.0, 1.0) } else { 0.0 };
+            let agl = ac.pos.y - world.terrain.surface(ac.pos.x, ac.pos.z) - ac.spec.rest_height;
+            ac.air = weather.air(ac.pos, agl, time, ac.spec.span, ac.right());
+            time += dt;
+            ac.step(dt, &world.terrain);
+            if std::env::var("TRACE").is_ok() && (ac.on_ground || ac.telem(&world.terrain).agl_ft < 40.0) && (time * 10.0) as i32 % 2 == 0 && ((time - dt) * 10.0) as i32 % 2 == 1 {
+                println!("t {time:.1} agl {:.0} bank {:.1} beta {:.1} roll {:.2} yaw {:.2} hdg {:.1} z {:.1} gnd {}", ac.telem(&world.terrain).agl_ft, ac.bank_deg(), ac.beta.to_degrees(), ac.ctl.roll, ac.ctl.yaw, ac.heading_deg(), ac.pos.z, ac.on_ground);
+            }
+            assert!(ac.crashed.is_none(), "crashed: {:?} at {:?} agl {:.0} vs {:.0} ias {:.0} pitch {:.1} bank {:.1} beta {:.1} step {}", ac.crashed, ac.pos, ac.telem(&world.terrain).agl_ft, ac.vel.y / crate::flight::FT * 60.0, ac.ias / KT, ac.pitch_deg(), ac.bank_deg(), ac.beta.to_degrees(), m.step);
+            let t = ac.telem(&world.terrain);
+            m.update(lesson, &t, prev, &world, ac.touchdown, &mut best, dt);
+            prev = ac.pos;
+            if m.complete {
+                break;
+            }
+        }
+        assert!(m.complete, "stuck at step {}", m.step);
+        assert!(!ac.tail_strike, "tail strike");
+        assert!(ac.pos.x < RWY_HALF_LEN, "ran off the end");
+        (m.summary, said)
+    }
+
+    #[test]
+    fn scripted_pilot_lands_the_737() {
+        let (summary, said) = fly_737_landing(crate::weather::Weather::calm());
+        println!("737 landing: {summary:?}\ncallouts: {said:?}");
+        use crate::audio::Callout;
+        assert!(said.contains(&Callout::Ft50) && said.contains(&Callout::Ft10), "missing height callouts: {said:?}");
+        assert!(!said.iter().any(|c| matches!(c, Callout::SinkRate | Callout::PullUp | Callout::TooLowGear)), "warnings on a good approach: {said:?}");
+    }
+
+    #[test]
+    fn scripted_pilot_lands_the_737_in_a_gusty_crosswind() {
+        let w = crate::weather::Weather { wind_from: 30.0, wind_kt: 18.0, gust_kt: 8.0, turbulence: 0.4, ..Default::default() };
+        let (summary, _) = fly_737_landing(w);
+        println!("crosswind landing: {summary:?}");
+        assert!(summary.len() >= 3);
     }
 }

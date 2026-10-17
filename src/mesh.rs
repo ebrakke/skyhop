@@ -127,7 +127,7 @@ impl MeshData {
 
 // -------------------------------------------------------------- terrain ---
 
-fn terrain_color(h: f32, ny: f32, x: f32, z: f32) -> Col {
+pub fn terrain_color(h: f32, ny: f32, x: f32, z: f32) -> Col {
     let var = fbm(x / 260.0 + 7.0, z / 260.0, 3);
     let sand = rgb(0.80, 0.74, 0.55);
     let wet = rgb(0.55, 0.52, 0.42);
@@ -280,7 +280,7 @@ pub fn clouds(world: &World) -> MeshData {
         let base = m.v.len() as u32;
         for p in &sv {
             let n = (*p / b.radii).normalize();
-            let shade = lerp(0.72, 1.0, smoothstep(-0.6, 0.5, p.y));
+            let shade = lerp(0.8, 1.0, smoothstep(-0.6, 0.5, p.y));
             m.vert(b.center + *p * b.radii, n, [shade, shade, shade * 1.02, 1.0]);
         }
         for f in &sf {
@@ -335,14 +335,23 @@ pub fn markings() -> MeshData {
     for side in [-1.0f32, 1.0] {
         let th = side * RWY_HALF_LEN; // threshold
         let inward = -side;
-        for k in 0..4 {
+        let stripes = ((RWY_HALF_W - 3.0) / 3.0) as usize;
+        for k in 0..stripes {
             let off = 2.2 + k as f32 * 3.0;
             rect(&mut m, th + inward * 22.0, off, 30.0, 1.6);
             rect(&mut m, th + inward * 22.0, -off, 30.0, 1.6);
         }
         // aiming point blocks
-        rect(&mut m, th + inward * 300.0, 6.0, 45.0, 4.0);
-        rect(&mut m, th + inward * 300.0, -6.0, 45.0, 4.0);
+        rect(&mut m, th + inward * 400.0, 8.0, 45.0, 6.0);
+        rect(&mut m, th + inward * 400.0, -8.0, 45.0, 6.0);
+        // touchdown zone bars
+        for (k, n) in [(150.0, 3), (300.0, 2), (550.0, 2), (700.0, 1), (850.0, 1)] {
+            for j in 0..n {
+                let off = 4.0 + j as f32 * 2.6 + 3.5;
+                rect(&mut m, th + inward * k, off, 22.0, 1.8);
+                rect(&mut m, th + inward * k, -off, 22.0, 1.8);
+            }
+        }
         // runway numbers, read when approaching from outside the threshold
         let digits: [u8; 2] = if side < 0.0 { [0, 9] } else { [2, 7] };
         let rot = if side < 0.0 { Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2) } else { Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) };
@@ -420,6 +429,33 @@ pub fn torus(minor: f32) -> MeshData {
     m
 }
 
+/// Unit sprite for smoke and dust: opaque in the middle, fading to nothing at the rim.
+pub fn puff() -> MeshData {
+    let mut m = MeshData::default();
+    let c = m.vert(Vec3::ZERO, Vec3::Z, [1.0, 1.0, 1.0, 1.0]);
+    for k in 0..=24 {
+        let a = k as f32 / 24.0 * std::f32::consts::TAU;
+        m.vert(vec3(a.cos(), a.sin(), 0.0), Vec3::Z, [1.0, 1.0, 1.0, 0.0]);
+    }
+    for k in 0..24 {
+        m.i.extend_from_slice(&[c, c + 1 + k, c + 2 + k]);
+    }
+    m
+}
+
+/// A wide flat sheet for the overcast deck, centred under the camera each frame.
+pub fn deck() -> MeshData {
+    let mut m = MeshData::default();
+    let s = 50_000.0;
+    let c = rgb(1.0, 1.0, 1.0);
+    let a = m.vert(vec3(-s, 0.0, -s), Vec3::Y, c);
+    m.vert(vec3(s, 0.0, -s), Vec3::Y, c);
+    m.vert(vec3(s, 0.0, s), Vec3::Y, c);
+    m.vert(vec3(-s, 0.0, s), Vec3::Y, c);
+    m.i.extend_from_slice(&[a, a + 1, a + 2, a, a + 2, a + 3]);
+    m
+}
+
 pub fn disc(r: f32) -> MeshData {
     let mut m = MeshData::default();
     let c = m.vert(Vec3::ZERO, Vec3::Z, rgb(1.0, 1.0, 1.0));
@@ -441,17 +477,59 @@ pub const ELEV_PIVOT: Vec3 = vec3(0.0, 0.24, 4.3);
 pub const RUD_PIVOT: Vec3 = vec3(0.0, 1.0, 4.45);
 pub const PROP_PIVOT: Vec3 = vec3(0.0, -0.05, -2.75);
 
-pub struct PlaneParts {
-    pub fuselage: MeshData, // hidden in the cockpit view
-    pub cowl: MeshData,
-    pub wings: MeshData,
-    pub flap_l: MeshData,
-    pub flap_r: MeshData,
-    pub ail_l: MeshData,
-    pub ail_r: MeshData,
-    pub elevator: MeshData,
-    pub rudder: MeshData,
-    pub prop: MeshData,
+/// What moves a part of the model.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Drive {
+    Fixed,
+    /// Turns about its hinge by the flap angle (trailing edge down).
+    Flap,
+    /// Turns by the aileron deflection times this sign (one per side).
+    Aileron(f32),
+    Elevator,
+    Rudder,
+    /// Spins with the propeller or fan.
+    Spin,
+    /// Hinges up with the speedbrake.
+    Spoiler,
+    /// Slides up into the body as the gear retracts.
+    Gear,
+    /// Thrust-reverser sleeve: slides aft.
+    Reverser,
+    /// Afterburner flame: grows with the burner and glows.
+    Burner,
+}
+
+/// When a part is drawn.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Seen {
+    Always,
+    /// Hidden from the cockpit (fuselage, prop): it would block the view.
+    Outside,
+    Cockpit,
+}
+
+pub struct Part {
+    pub mesh: MeshData,
+    pub pivot: Vec3,
+    /// Hinge axis; for flaps and ailerons pointing along +x-ish so a positive angle lowers the trailing edge.
+    pub axis: Vec3,
+    pub drive: Drive,
+    pub seen: Seen,
+}
+
+impl Part {
+    pub fn fixed(mesh: MeshData, seen: Seen) -> Self {
+        Part { mesh, pivot: Vec3::ZERO, axis: Vec3::X, drive: Drive::Fixed, seen }
+    }
+    pub fn hinged(mesh: MeshData, pivot: Vec3, axis: Vec3, drive: Drive, seen: Seen) -> Self {
+        Part { mesh, pivot, axis: axis.normalize(), drive, seen }
+    }
+}
+
+pub struct Model {
+    pub parts: Vec<Part>,
+    /// Translucent propeller disc: centre and radius.
+    pub prop_disc: Option<(Vec3, f32)>,
 }
 
 fn wing_y(x: f32) -> f32 {
@@ -477,7 +555,8 @@ fn wing_slab(m: &mut MeshData, x0: f32, x1: f32, z0: f32, z1: f32, col: Col) {
     );
 }
 
-pub fn plane() -> PlaneParts {
+/// The high-wing trainer.
+pub fn trainer() -> Model {
     let white = rgb(0.94, 0.94, 0.95);
     let light = rgb(0.80, 0.81, 0.84);
     let stripe = rgb(0.12, 0.33, 0.70);
@@ -635,5 +714,63 @@ pub fn plane() -> PlaneParts {
     let mut prop = MeshData::default();
     prop.beam(vec3(0.0, -1.0, -2.78), vec3(0.0, 0.9, -2.78), 0.11, dark);
 
-    PlaneParts { fuselage: fus, cowl, wings, flap_l, flap_r, ail_l, ail_r, elevator, rudder, prop }
+    let (fp, ap) = (FLAP_PIVOT, AIL_PIVOT);
+    let mirror = |p: Vec3| vec3(-p.x, p.y, p.z);
+    Model {
+        parts: vec![
+            Part::fixed(cowl, Seen::Always),
+            Part::fixed(wings, Seen::Always),
+            Part::hinged(flap_l, mirror(fp), Vec3::X, Drive::Flap, Seen::Always),
+            Part::hinged(flap_r, fp, Vec3::X, Drive::Flap, Seen::Always),
+            Part::hinged(ail_l, mirror(ap), Vec3::X, Drive::Aileron(1.0), Seen::Always),
+            Part::hinged(ail_r, ap, Vec3::X, Drive::Aileron(-1.0), Seen::Always),
+            Part::fixed(cockpit(), Seen::Cockpit),
+            Part::hinged(prop, PROP_PIVOT, Vec3::Z, Drive::Spin, Seen::Outside),
+            Part::fixed(fus, Seen::Outside),
+            Part::hinged(elevator, ELEV_PIVOT, Vec3::X, Drive::Elevator, Seen::Outside),
+            Part::hinged(rudder, RUD_PIVOT, Vec3::Y, Drive::Rudder, Seen::Outside),
+        ],
+        prop_disc: Some((vec3(0.0, -0.05, -2.8), 0.95)),
+    }
+}
+
+/// The view from the left seat: glareshield, window frames, door sills and headliner,
+/// following the fuselage loft (windshield from z -1.2, y 0.5 up to z -0.4, y 0.95).
+fn cockpit() -> MeshData {
+    let dash = rgb(0.17, 0.17, 0.18);
+    let frame = rgb(0.30, 0.30, 0.31);
+    let trim = rgb(0.50, 0.47, 0.42);
+    let roof = rgb(0.66, 0.64, 0.60);
+    let mut m = MeshData::default();
+    // glareshield and panel face
+    m.hexa(
+        [
+            vec3(-0.6, 0.2, -0.78),
+            vec3(0.6, 0.2, -0.78),
+            vec3(0.6, 0.2, -1.2),
+            vec3(-0.6, 0.2, -1.2),
+            vec3(-0.6, 0.57, -0.78),
+            vec3(0.6, 0.57, -0.78),
+            vec3(0.56, 0.53, -1.2),
+            vec3(-0.56, 0.53, -1.2),
+        ],
+        dash,
+    );
+    m.beam(vec3(-0.6, 0.57, -0.77), vec3(0.6, 0.57, -0.77), 0.03, rgb(0.09, 0.09, 0.1));
+    // magnetic compass on top of the glareshield
+    m.aabb(vec3(-0.025, 0.57, -0.98), vec3(0.025, 0.615, -0.93), rgb(0.08, 0.08, 0.08));
+    m.aabb(vec3(-0.018, 0.578, -0.932), vec3(0.018, 0.607, -0.928), rgb(0.85, 0.82, 0.7));
+    // windshield frame: side pillars, centre strip and the top bow
+    for sx in [-1.0f32, 1.0] {
+        m.beam(vec3(0.56 * sx, 0.53, -1.18), vec3(0.6 * sx, 0.9, -0.42), 0.045, frame);
+        m.beam(vec3(0.6 * sx, 0.4, -0.42), vec3(0.6 * sx, 0.91, -0.42), 0.04, frame);
+        // door sill and lower door panel
+        m.beam(vec3(0.6 * sx, 0.42, -1.2), vec3(0.6 * sx, 0.42, 0.6), 0.04, frame);
+        m.quad(vec3(0.61 * sx, 0.0, -1.2), vec3(0.61 * sx, 0.0, 0.6), vec3(0.61 * sx, 0.42, 0.6), vec3(0.61 * sx, 0.42, -1.2), trim, Some(vec3(0.0, 0.3, 0.0)));
+    }
+    m.beam(vec3(0.0, 0.53, -1.18), vec3(0.0, 0.9, -0.44), 0.018, frame);
+    m.beam(vec3(-0.6, 0.9, -0.42), vec3(0.6, 0.9, -0.42), 0.045, frame);
+    // headliner
+    m.quad(vec3(-0.62, 0.91, -0.42), vec3(0.62, 0.91, -0.42), vec3(0.62, 0.91, 0.9), vec3(-0.62, 0.91, 0.9), roof, Some(vec3(0.0, 0.5, 0.0)));
+    m
 }

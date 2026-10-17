@@ -5,7 +5,9 @@ edition = "2021"
 description = "A small, friendly flight sim for learning the basics of flying"
 
 [dependencies]
-macroquad = { version = "0.4.16", default-features = false, features = ["audio"] }
+gilrs = "0.11.2"
+macroquad = { version = "0.4.16", default-features = false }
+tinyaudio = "2"
 
 [profile.release]
 opt-level = 3

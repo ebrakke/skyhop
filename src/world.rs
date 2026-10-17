@@ -9,12 +9,22 @@ pub const SEA: f32 = 0.0;
 
 // Runway 09/27 runs east-west through the origin. Heading 090 is +x.
 pub const RWY_ELEV: f32 = 12.0;
-pub const RWY_HALF_LEN: f32 = 700.0;
-pub const RWY_HALF_W: f32 = 15.0;
+pub const RWY_HALF_LEN: f32 = 1500.0;
+pub const RWY_HALF_W: f32 = 22.5;
 /// Distance from each threshold to its PAPI lights.
-pub const PAPI_DIST: f32 = 300.0;
+pub const PAPI_DIST: f32 = 400.0;
 
 pub const TOWER_POS: Vec3 = vec3(-180.0, RWY_ELEV + 24.0, -110.0);
+
+/// The grass strip on the south coast: centre, half length (it runs east-west) and elevation.
+pub const STRIP: (f32, f32) = (-600.0, 7180.0);
+pub const STRIP_HALF_LEN: f32 = 420.0;
+pub const STRIP_HALF_W: f32 = 14.0;
+pub const STRIP_ELEV: f32 = 23.0;
+/// The harbour town on the south-east coast, the lighthouse on the west cape, and the line of
+/// wind turbines along the north-east ridge.
+pub const PORT: (f32, f32) = (3150.0, 5550.0);
+pub const LIGHTHOUSE: (f32, f32) = (-8170.0, 60.0);
 
 pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -89,6 +99,13 @@ pub fn airport_factor(x: f32, z: f32) -> f32 {
     1.0 - smoothstep(0.0, 900.0, (ax * ax + az * az).sqrt())
 }
 
+/// 1 on the grass strip, falling to 0 a couple of hundred metres around it.
+pub fn strip_factor(x: f32, z: f32) -> f32 {
+    let ax = ((x - STRIP.0).abs() - STRIP_HALF_LEN - 40.0).max(0.0);
+    let az = ((z - STRIP.1).abs() - 35.0).max(0.0);
+    1.0 - smoothstep(0.0, 220.0, (ax * ax + az * az).sqrt())
+}
+
 fn raw_height(x: f32, z: f32) -> f32 {
     let d = (x * x + z * z).sqrt();
     let wobble = fbm(x / 4000.0 + 11.0, z / 4000.0 - 7.0, 4) - 0.5;
@@ -110,6 +127,7 @@ fn raw_height(x: f32, z: f32) -> f32 {
         let ceiling = RWY_ELEV - 4.0 + (x.abs() - RWY_HALF_LEN - 200.0).max(0.0) * 0.035;
         h = lerp(h, h.min(ceiling), corridor);
     }
+    let h = lerp(h, STRIP_ELEV, strip_factor(x, z));
     lerp(h, RWY_ELEV, airport_factor(x, z))
 }
 
@@ -178,6 +196,7 @@ impl Terrain {
 
 // ---------------------------------------------------------------- world ---
 
+#[derive(Clone)]
 pub struct Rng(u64);
 
 impl Rng {
@@ -216,6 +235,14 @@ pub struct CloudBlob {
     pub radii: Vec3,
 }
 
+/// A rising column of warm air: centre, radius (m) and core strength (m/s).
+pub struct Thermal {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    pub strength: f32,
+}
+
 pub struct Ring {
     pub pos: Vec3,
     pub normal: Vec3,
@@ -228,6 +255,12 @@ pub struct World {
     pub buildings: Vec<Building>,
     pub clouds: Vec<CloudBlob>,
     pub rings: Vec<Ring>,
+    pub thermals: Vec<Thermal>,
+    /// Village and town centres (the roads join them up).
+    pub towns: Vec<Vec3>,
+    /// Roads as polylines on the ground.
+    pub roads: Vec<Vec<Vec3>>,
+    pub turbines: Vec<Vec3>,
 }
 
 pub const RING_START: Vec3 = vec3(-900.0, 450.0, 0.0);
@@ -237,10 +270,13 @@ impl World {
         let terrain = Terrain::generate();
         let mut rng = Rng::new(42);
         let trees = place_trees(&terrain, &mut rng);
-        let buildings = place_buildings(&terrain, &mut rng);
-        let clouds = place_clouds(&mut rng);
+        let (buildings, towns) = place_buildings(&terrain, &mut rng);
+        let (clouds, centres) = place_clouds(&mut rng);
         let rings = place_rings(&terrain);
-        World { terrain, trees, buildings, clouds, rings }
+        let thermals = place_thermals(&terrain, &centres, &mut rng);
+        let roads = place_roads(&terrain, &towns, &mut rng);
+        let turbines = place_turbines(&terrain);
+        World { terrain, trees, buildings, clouds, rings, thermals, towns, roads, turbines }
     }
 
     /// How deep the point is inside a cloud, 0 = outside, 1 = at a blob centre.
@@ -263,7 +299,7 @@ fn place_trees(t: &Terrain, rng: &mut Rng) -> Vec<Tree> {
         let x = rng.range(-HALF * 0.95, HALF * 0.95);
         let z = rng.range(-HALF * 0.95, HALF * 0.95);
         let h = t.height(x, z);
-        if !(6.0..720.0).contains(&h) || airport_factor(x, z) > 0.05 {
+        if !(6.0..720.0).contains(&h) || airport_factor(x, z) > 0.05 || strip_factor(x, z) > 0.05 {
             continue;
         }
         if t.normal(x, z).y < 0.8 {
@@ -278,7 +314,7 @@ fn place_trees(t: &Terrain, rng: &mut Rng) -> Vec<Tree> {
     trees
 }
 
-fn place_buildings(t: &Terrain, rng: &mut Rng) -> Vec<Building> {
+fn place_buildings(t: &Terrain, rng: &mut Rng) -> (Vec<Building>, Vec<Vec3>) {
     let mut b = Vec::new();
     let g = RWY_ELEV;
     let gray = [0.78, 0.79, 0.8, 1.0];
@@ -293,6 +329,7 @@ fn place_buildings(t: &Terrain, rng: &mut Rng) -> Vec<Building> {
     let wall_cols = [[0.95, 0.93, 0.86, 1.0], [0.92, 0.85, 0.72, 1.0], [0.85, 0.88, 0.9, 1.0], [0.96, 0.9, 0.8, 1.0]];
     let roof_cols = [[0.62, 0.22, 0.16, 1.0], [0.45, 0.3, 0.22, 1.0], [0.3, 0.33, 0.38, 1.0]];
     let mut villages = 0;
+    let mut towns = Vec::new();
     for _ in 0..4000 {
         if villages >= 5 {
             break;
@@ -301,10 +338,11 @@ fn place_buildings(t: &Terrain, rng: &mut Rng) -> Vec<Building> {
         let d = rng.range(1600.0, 6500.0);
         let (cx, cz) = (a.cos() * d, a.sin() * d);
         let h = t.height(cx, cz);
-        if !(4.0..90.0).contains(&h) || t.normal(cx, cz).y < 0.985 {
+        if !(4.0..90.0).contains(&h) || t.normal(cx, cz).y < 0.985 || airport_factor(cx, cz) > 0.02 {
             continue;
         }
         villages += 1;
+        towns.push(vec3(cx, h, cz));
         let mut placed = 0;
         for _ in 0..200 {
             if placed >= 18 {
@@ -327,15 +365,96 @@ fn place_buildings(t: &Terrain, rng: &mut Rng) -> Vec<Building> {
             placed += 1;
         }
     }
-    b
+    // the harbour town: a tight cluster of houses, a church and warehouses by the water
+    let (px, pz) = PORT;
+    towns.push(vec3(px, t.height(px, pz), pz));
+    let mut placed = 0;
+    for _ in 0..3000 {
+        if placed >= 70 {
+            break;
+        }
+        let x = px + rng.range(-420.0, 420.0);
+        let z = pz + rng.range(-420.0, 420.0);
+        let h = t.height(x, z);
+        if !(2.0..45.0).contains(&h) || t.normal(x, z).y < 0.94 {
+            continue;
+        }
+        let big = rng.f() < 0.15;
+        let w = if big { rng.range(14.0, 24.0) } else { rng.range(7.0, 11.0) };
+        b.push(Building {
+            pos: vec3(x, h - 0.3, z),
+            size: vec3(w, if big { rng.range(6.0, 9.0) } else { rng.range(5.0, 9.5) }, if big { rng.range(10.0, 16.0) } else { rng.range(6.0, 9.0) }),
+            yaw: (rng.range(-0.3, 0.3)) + if rng.f() < 0.5 { 0.0 } else { 1.5708 },
+            wall: wall_cols[rng.next_u32() as usize % wall_cols.len()],
+            roof: Some(roof_cols[rng.next_u32() as usize % roof_cols.len()]),
+        });
+        placed += 1;
+    }
+    let ch = t.height(px, pz).max(3.0);
+    b.push(Building { pos: vec3(px + 20.0, ch - 0.3, pz - 40.0), size: vec3(8.0, 26.0, 8.0), yaw: 0.0, wall: [0.93, 0.9, 0.84, 1.0], roof: Some([0.45, 0.3, 0.22, 1.0]) });
+    b.push(Building { pos: vec3(px + 20.0, ch - 0.3, pz - 22.0), size: vec3(12.0, 10.0, 22.0), yaw: 0.0, wall: [0.93, 0.9, 0.84, 1.0], roof: Some([0.62, 0.22, 0.16, 1.0]) });
+    // the grass strip's hangar
+    b.push(Building { pos: vec3(STRIP.0 + 120.0, STRIP_ELEV, STRIP.1 - 60.0), size: vec3(24.0, 7.0, 18.0), yaw: 0.0, wall: [0.75, 0.7, 0.6, 1.0], roof: Some([0.35, 0.38, 0.4, 1.0]) });
+    // airport terminal and its tower-side offices
+    b.push(Building { pos: vec3(660.0, g, -178.0), size: vec3(360.0, 14.0, 44.0), yaw: 0.0, wall: [0.5, 0.64, 0.76, 1.0], roof: None });
+    b.push(Building { pos: vec3(660.0, g + 14.0, -178.0), size: vec3(364.0, 1.2, 48.0), yaw: 0.0, wall: [0.86, 0.87, 0.88, 1.0], roof: None });
+    b.push(Building { pos: vec3(420.0, g, -190.0), size: vec3(60.0, 22.0, 30.0), yaw: 0.0, wall: [0.82, 0.83, 0.85, 1.0], roof: None });
+    // jet bridges reaching out from the terminal
+    for k in 0..4 {
+        b.push(Building { pos: vec3(540.0 + k as f32 * 80.0 - 8.0, g + 3.0, -150.0), size: vec3(4.0, 3.5, 12.0), yaw: 0.0, wall: [0.75, 0.76, 0.78, 1.0], roof: None });
+    }
+    (b, towns)
 }
 
-fn place_clouds(rng: &mut Rng) -> Vec<CloudBlob> {
+/// Gently wandering roads from the airport to every town, and on to the grass strip.
+fn place_roads(t: &Terrain, towns: &[Vec3], rng: &mut Rng) -> Vec<Vec<Vec3>> {
+    let airport = vec3(300.0, RWY_ELEV, -260.0);
+    let strip = vec3(STRIP.0 + 150.0, STRIP_ELEV, STRIP.1 - 120.0);
+    let mut ends: Vec<(Vec3, Vec3)> = towns.iter().map(|c| (airport, *c)).collect();
+    if let Some(port) = towns.last() {
+        ends.push((*port, strip));
+    }
+    ends.push((airport, strip));
+    let mut roads = Vec::new();
+    for (a, b) in ends {
+        let len = (b - a).length();
+        let n = (len / 40.0) as usize + 2;
+        let side = vec3(-(b - a).z, 0.0, (b - a).x).normalize_or_zero();
+        let seed = rng.range(0.0, 100.0);
+        let pts: Vec<Vec3> = (0..=n)
+            .map(|i| {
+                let f = i as f32 / n as f32;
+                // bend sideways along the way, pinned at both ends
+                let wiggle = (fbm(f * 3.0 + seed, seed, 3) - 0.5) * len * 0.25 * (f * std::f32::consts::PI).sin();
+                let p = a.lerp(b, f) + side * wiggle;
+                vec3(p.x, t.height(p.x, p.z), p.z)
+            })
+            .collect();
+        roads.push(pts);
+    }
+    roads
+}
+
+/// A line of turbines along the north-east ridge.
+fn place_turbines(t: &Terrain) -> Vec<Vec3> {
+    (0..7)
+        .map(|k| {
+            let f = k as f32 / 6.0;
+            let (x, z) = (1250.0 + f * 1100.0, -2950.0 - f * 950.0);
+            vec3(x, t.height(x, z), z)
+        })
+        .collect()
+}
+
+/// Cumulus puffs, and the centre of each cloud (thermals feed them from below).
+fn place_clouds(rng: &mut Rng) -> (Vec<CloudBlob>, Vec<Vec3>) {
     let mut blobs = Vec::new();
+    let mut centres = Vec::new();
     for _ in 0..55 {
         let a = rng.range(0.0, std::f32::consts::TAU);
         let d = rng.range(1500.0, 16_000.0).sqrt() * 120.0; // bias toward the middle
         let base = vec3(a.cos() * d, rng.range(1450.0, 1900.0), a.sin() * d);
+        centres.push(base);
         let n = 4 + rng.next_u32() % 5;
         for _ in 0..n {
             let off = vec3(rng.range(-230.0, 230.0), rng.range(0.0, 90.0), rng.range(-230.0, 230.0));
@@ -343,7 +462,28 @@ fn place_clouds(rng: &mut Rng) -> Vec<CloudBlob> {
             blobs.push(CloudBlob { center: base + off, radii: vec3(r, r * rng.range(0.45, 0.65), r * rng.range(0.85, 1.15)) });
         }
     }
-    blobs
+    (blobs, centres)
+}
+
+/// Thermals under the cumulus that sit over land, plus a few more over open fields.
+fn place_thermals(t: &Terrain, clouds: &[Vec3], rng: &mut Rng) -> Vec<Thermal> {
+    let mut out = Vec::new();
+    for c in clouds {
+        if t.height(c.x, c.z) > 5.0 {
+            out.push(Thermal { x: c.x + rng.range(-150.0, 150.0), z: c.z + rng.range(-150.0, 150.0), radius: rng.range(200.0, 340.0), strength: rng.range(1.8, 4.0) });
+        }
+    }
+    for _ in 0..400 {
+        if out.len() > 70 {
+            break;
+        }
+        let (x, z) = (rng.range(-7000.0, 7000.0), rng.range(-7000.0, 7000.0));
+        let h = t.height(x, z);
+        if (10.0..300.0).contains(&h) && forest_density(x, z) < 0.3 && airport_factor(x, z) < 0.3 {
+            out.push(Thermal { x, z, radius: rng.range(160.0, 260.0), strength: rng.range(1.2, 2.8) });
+        }
+    }
+    out
 }
 
 fn place_rings(t: &Terrain) -> Vec<Ring> {
@@ -379,3 +519,4 @@ fn place_rings(t: &Terrain) -> Vec<Ring> {
     }
     rings
 }
+
